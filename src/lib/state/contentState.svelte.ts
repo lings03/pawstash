@@ -1,10 +1,25 @@
 import type { CreatorProfile, Post } from '$lib/types/content';
-import { apiFetchCreatorPosts, apiFetchCreatorProfile, apiFetchPost, apiGetCachedPost } from '$lib/utils/ipc';
+import {
+  apiFetchCreatorPosts,
+  apiFetchCreatorProfile,
+  apiFetchPost,
+  apiGetCachedPost,
+  type PartialPostsEvent
+} from '$lib/utils/ipc';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { logger } from '$lib/utils/logger';
 import { creatorsState } from '$lib/state/creatorsState.svelte';
+import { extraField } from '$lib/utils/fields';
 
 const PAGE_SIZE = 50;
 const MAX_PREFETCH_PAGES = 3;
+
+const postKey = (post: Post) => `${post.service}:${post.user}:${post.id}`;
+
+function sortByPublishedDesc(posts: Post[]): Post[] {
+  const ts = (post: Post) => Number(post.published ?? post.added ?? 0) || 0;
+  return [...posts].sort((a, b) => ts(b) - ts(a));
+}
 
 export interface CachedPost {
   post: Post | null;
@@ -30,36 +45,88 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
-export function normalizePostId(postId: unknown): string {
-  if (postId === null || postId === undefined) return '';
-  if (typeof postId === 'string' || typeof postId === 'number') {
-    const s = String(postId).trim();
-    return s === '[object Object]' ? '' : s;
-  }
-  if (typeof postId === 'object') {
-    const obj = postId as Record<string, unknown>;
-    const candidate = obj.id ?? obj.post_id ?? obj.postId;
-    if (candidate !== null && candidate !== undefined) {
-      return normalizePostId(candidate);
-    }
-  }
-  return '';
-}
-
-export function postCacheKey(service: string, creatorId: string | number, postId: unknown, providerId?: string) {
-  const normId = normalizePostId(postId);
-  const prov = (providerId && providerId !== 'auto') ? `:${providerId.toLowerCase()}` : '';
-  return `${String(service || '').toLowerCase()}:${String(creatorId || '').toLowerCase()}:${normId}${prov}`;
-}
-
-export function creatorCacheKey(service: string, creatorId: string | number, providerId?: string) {
-  const prov = (providerId && providerId !== 'auto') ? providerId.toLowerCase() : 'auto';
-  return `${String(service || '').toLowerCase()}:${String(creatorId || '').toLowerCase()}:${prov}`;
-}
+export { normalizePostId, postCacheKey, creatorCacheKey } from '$lib/utils/cacheKey';
+import { normalizePostId, postCacheKey, creatorCacheKey } from '$lib/utils/cacheKey';
 
 export class ContentState {
   posts = $state<Record<string, CachedPost>>({});
   creators = $state<Record<string, CachedCreator>>({});
+  private maxCachedPosts = 500;
+  private maxCachedCreators = 50;
+
+  private activeStream: { id: string; key: string; seeded: boolean } | null = null;
+  private partialListener: Promise<UnlistenFn> | null = null;
+
+  private async beginStream(id: string, key: string) {
+    this.activeStream = { id, key, seeded: false };
+    this.partialListener ??= listen<PartialPostsEvent>('posts-partial', (event) => {
+      const active = this.activeStream;
+      if (!active || event.payload.stream_id !== active.id) return;
+      const current = this.creators[active.key];
+      if (!current) return;
+
+      const merged = new Map(
+        (active.seeded ? current.posts : []).map((post) => [postKey(post), post])
+      );
+      active.seeded = true;
+      for (const post of event.payload.posts) {
+        const postId = postKey(post);
+        if (!merged.has(postId)) merged.set(postId, post);
+      }
+      this.creators[active.key] = {
+        ...current,
+        posts: sortByPublishedDesc([...merged.values()]),
+        loaded: true
+      };
+    }).catch((error) => {
+      this.partialListener = null;
+      logger.warn('[Content] Streaming unavailable; waiting for full results', error);
+      return () => {};
+    });
+    await this.partialListener;
+  }
+
+  private putPost(key: string, entry: CachedPost) {
+    delete this.posts[key];
+    this.posts[key] = entry;
+    this.evictPostsIfNeeded();
+  }
+
+  private putCreator(key: string, entry: CachedCreator) {
+    delete this.creators[key];
+    this.creators[key] = entry;
+    this.evictCreatorsIfNeeded();
+  }
+
+  private evictPostsIfNeeded() {
+    const keys = Object.keys(this.posts);
+    if (keys.length <= this.maxCachedPosts) return;
+    const excess = keys.length - this.maxCachedPosts;
+    let evicted = 0;
+    for (const k of keys) {
+      if (evicted >= excess) break;
+      const entry = this.posts[k];
+      if (entry && !entry.loading) {
+        delete this.posts[k];
+        evicted++;
+      }
+    }
+  }
+
+  private evictCreatorsIfNeeded() {
+    const keys = Object.keys(this.creators);
+    if (keys.length <= this.maxCachedCreators) return;
+    const excess = keys.length - this.maxCachedCreators;
+    let evicted = 0;
+    for (const k of keys) {
+      if (evicted >= excess) break;
+      const entry = this.creators[k];
+      if (entry && !entry.loading && !entry.loadingMore) {
+        delete this.creators[k];
+        evicted++;
+      }
+    }
+  }
 
   getPostAccent(service: string, creatorId: string | number, postId: string | number, providerId?: string): string | undefined {
     const key = postCacheKey(service, creatorId, postId, providerId);
@@ -98,26 +165,13 @@ export class ContentState {
   setPost(post: Post) {
     if (!post?.id || !post?.service || !post?.user) return;
     const key = postCacheKey(post.service, post.user, post.id);
-    const existing = this.posts[key];
-    this.posts[key] = {
-      ...(existing || {}),
+    this.putPost(key, {
+      ...(this.posts[key] || {}),
       post,
       loaded: post.detail_fetched === true,
       loading: false,
       error: null
-    };
-    const provId = (post.extra as any)?.provider_id;
-    if (typeof provId === 'string' && provId.trim()) {
-      const provKey = postCacheKey(post.service, post.user, post.id, provId);
-      const existingProv = this.posts[provKey];
-      this.posts[provKey] = {
-        ...(existingProv || {}),
-        post,
-        loaded: post.detail_fetched === true,
-        loading: false,
-        error: null
-      };
-    }
+    });
   }
 
   setPosts(posts: Post[]) {
@@ -128,24 +182,30 @@ export class ContentState {
 
   getPost(service: string, creatorId: string | number, postId: unknown, providerId?: string) {
     const key = postCacheKey(service, creatorId, postId, providerId);
+    if (!this.posts[key] && providerId && providerId !== 'auto') {
+      const canonicalKey = postCacheKey(service, creatorId, postId);
+      if (this.posts[canonicalKey]) {
+        return this.posts[canonicalKey];
+      }
+    }
     this.posts[key] ??= { post: null, loading: false, loaded: false, error: null };
     return this.posts[key];
   }
 
-  async loadPost(service: string, creatorId: string | number, rawPostId: unknown, force = false, providerId?: string) {
+  async loadPost(service: string, creatorId: string | number, rawPostId: unknown, force = false, providerId?: string, prefetch = false) {
     const postId = normalizePostId(rawPostId);
     if (!postId || !service || !creatorId) return;
 
     const key = postCacheKey(service, creatorId, postId, providerId);
     const entry = this.getPost(service, creatorId, postId, providerId);
-    if (!force && ((entry.loaded && entry.post?.detail_fetched) || entry.loading || entry.error)) return;
     if (entry.loading) return;
+    if (!force && entry.loaded && entry.post?.detail_fetched) return;
 
     if (!entry.post || !entry.post.detail_fetched) {
       try {
         const cached = await apiGetCachedPost(String(service), String(creatorId), String(postId), providerId);
         const isSpecificProvider = Boolean(providerId && providerId !== 'auto');
-        const cachedProv = (cached?.extra as any)?.provider_id;
+        const cachedProv = extraField(cached, 'provider_id');
         const matchesProvider = !isSpecificProvider || (typeof cachedProv === 'string' && Boolean(providerId) && cachedProv.toLowerCase() === providerId!.toLowerCase());
 
         if (cached && cached.detail_fetched && matchesProvider) {
@@ -182,8 +242,8 @@ export class ContentState {
     };
 
     try {
-      const detail = await apiFetchPost(String(service), String(creatorId), String(postId), providerId);
-      this.posts[key] = {
+      const detail = await apiFetchPost(String(service), String(creatorId), String(postId), providerId, prefetch);
+      this.putPost(key, {
         post: {
           ...(currentEntry.post || {}),
           ...detail,
@@ -194,11 +254,11 @@ export class ContentState {
         loading: false,
         loaded: true,
         error: null
-      };
+      });
     } catch (error) {
       const msg = errorMessage(error);
       const isSpecificProvider = Boolean(providerId && providerId !== 'auto');
-      const currentProv = (currentEntry.post?.extra as any)?.provider_id;
+      const currentProv = extraField(currentEntry.post, 'provider_id');
       const fallbackPost = (isSpecificProvider && providerId)
         ? (typeof currentProv === 'string' && currentProv.toLowerCase() === providerId.toLowerCase() ? currentEntry.post : null)
         : (currentEntry.post || this.getPost(service, creatorId, postId).post);
@@ -226,7 +286,7 @@ export class ContentState {
   private maxPrefetchConcurrency = 2;
   private queuedKeys = new Set<string>();
 
-  enqueueDetailPrefetch(service: string, creatorId: string | number, rawPostId: unknown) {
+  enqueueDetailPrefetch(service: string, creatorId: string | number, rawPostId: unknown, urgent = false) {
     const postId = normalizePostId(rawPostId);
     if (!postId || !service || !creatorId) return;
     const key = postCacheKey(service, creatorId, postId);
@@ -234,10 +294,17 @@ export class ContentState {
     const entry = this.posts[key];
     if (entry?.loaded && entry.post?.detail_fetched) return;
     if (entry?.loading) return;
-    if (this.queuedKeys.has(key)) return;
 
+    const item = { service: String(service), creatorId: String(creatorId), postId };
+    if (this.queuedKeys.has(key)) {
+      if (!urgent) return;
+      this.prefetchQueue = this.prefetchQueue.filter(
+        (queued) => postCacheKey(queued.service, queued.creatorId, queued.postId) !== key
+      );
+    }
     this.queuedKeys.add(key);
-    this.prefetchQueue.push({ service: String(service), creatorId: String(creatorId), postId });
+    if (urgent) this.prefetchQueue.unshift(item);
+    else this.prefetchQueue.push(item);
     this.processPrefetchQueue();
   }
 
@@ -264,7 +331,7 @@ export class ContentState {
       this.prefetchRunning++;
       void (async () => {
         try {
-          await this.loadPost(item.service, item.creatorId, item.postId);
+          await this.loadPost(item.service, item.creatorId, item.postId, false, undefined, true);
         } catch {} finally {
           this.prefetchRunning--;
           setTimeout(() => this.processPrefetchQueue(), 50);
@@ -288,10 +355,11 @@ export class ContentState {
     return this.creators[key];
   }
 
-  async loadCreator(service: string, creatorId: string, autoFetchPosts = false, providerId?: string) {
+  async loadCreator(service: string, creatorId: string, autoFetchPosts = false, providerId?: string, force = false) {
     const key = creatorCacheKey(service, creatorId, providerId);
     const entry = this.getCreator(service, creatorId, providerId);
-    if (entry.loaded || entry.loading) {
+    const settled = entry.loaded && !entry.error && entry.posts.length > 0;
+    if (!force && (settled || entry.loading)) {
       if (entry.loaded && autoFetchPosts && entry.hasMore && !entry.loadingMore) {
         void this.autoFetchAllCreatorPosts(service, creatorId, providerId);
       }
@@ -320,10 +388,13 @@ export class ContentState {
     };
 
     try {
+      const streamId = `creator:${key}:${Date.now()}`;
+      await this.beginStream(streamId, key);
       const [profileResult, postsResult] = await Promise.allSettled([
         apiFetchCreatorProfile(service, creatorId, providerId),
-        apiFetchCreatorPosts(service, creatorId, undefined, 0, providerId)
+        apiFetchCreatorPosts(service, creatorId, undefined, 0, providerId, undefined, streamId)
       ]);
+      if (this.activeStream?.id === streamId) this.activeStream = null;
 
       let finalProfile: CreatorProfile = placeholderProfile;
       if (profileResult.status === 'fulfilled' && profileResult.value) {
@@ -353,7 +424,7 @@ export class ContentState {
 
       const posts = postsResult.value;
       const cur = this.creators[key] ?? entry;
-      this.creators[key] = {
+      this.putCreator(key, {
         ...cur,
         profile: finalProfile,
         posts,
@@ -362,7 +433,7 @@ export class ContentState {
         loaded: true,
         loading: false,
         error: null
-      };
+      });
       logger.info(`[Content] Loaded ${posts.length} posts for ${service}:${creatorId} (provider: ${providerId || 'auto'})`);
       if (autoFetchPosts && this.creators[key].hasMore) {
         void this.autoFetchAllCreatorPosts(service, creatorId, providerId);
@@ -393,10 +464,13 @@ export class ContentState {
     };
 
     try {
+      const streamId = `creator:${key}:${Date.now()}`;
+      await this.beginStream(streamId, key);
       const [profileResult, postsResult] = await Promise.allSettled([
         apiFetchCreatorProfile(service, creatorId, providerId),
-        apiFetchCreatorPosts(service, creatorId, undefined, 0, providerId)
+        apiFetchCreatorPosts(service, creatorId, undefined, 0, providerId, undefined, streamId)
       ]);
+      if (this.activeStream?.id === streamId) this.activeStream = null;
 
       let finalProfile: CreatorProfile = entry.profile || {
         id: creatorId,
@@ -505,6 +579,8 @@ export class ContentState {
         consecutiveErrors = 0;
         pagesFetched++;
         const cur = this.creators[key] ?? curEntry;
+        // A scroll load already took this page; applying it again would skip the next one.
+        if (cur.offset !== offset) break;
         const hasMore = posts.length >= PAGE_SIZE;
         const willPrefetchMore = hasMore && pagesFetched < MAX_PREFETCH_PAGES;
 
@@ -555,9 +631,14 @@ export class ContentState {
     try {
       const posts = await apiFetchCreatorPosts(service, creatorId, undefined, entry.offset, providerId);
       const cur = this.creators[key] ?? entry;
+      if (cur.offset !== entry.offset) {
+        this.creators[key] = { ...cur, loadingMore: false };
+        return;
+      }
+      const existingIds = new Set(cur.posts.map((p) => p.id));
       this.creators[key] = {
         ...cur,
-        posts: [...cur.posts, ...posts],
+        posts: [...cur.posts, ...posts.filter((p) => !existingIds.has(p.id))],
         offset: cur.offset + PAGE_SIZE,
         hasMore: posts.length >= PAGE_SIZE,
         loadingMore: false

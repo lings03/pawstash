@@ -2,8 +2,20 @@ use reqwest::{header::RETRY_AFTER, Response, StatusCode};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 use tokio::time::{sleep, Instant};
+
+tokio::task_local! {
+    static BACKGROUND: bool;
+}
+
+pub async fn in_background<F: Future>(work: F) -> F::Output {
+    BACKGROUND.scope(true, work).await
+}
+
+fn is_background() -> bool {
+    BACKGROUND.try_with(|flag| *flag).unwrap_or(false)
+}
 
 #[derive(Debug, Clone)]
 pub struct ProviderQueueConfig {
@@ -65,6 +77,7 @@ pub struct ProviderRequestQueue {
     provider_id: String,
     config: ProviderQueueConfig,
     semaphore: Arc<Semaphore>,
+    background: Arc<Semaphore>,
     gate: Arc<Mutex<QueueGate>>,
     rate_per_second: f64,
     burst_capacity: f64,
@@ -83,6 +96,7 @@ impl ProviderRequestQueue {
             provider_id: provider_id.into(),
             config,
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            background: Arc::new(Semaphore::new(max_concurrent.saturating_sub(1).max(1))),
             gate: Arc::new(Mutex::new(QueueGate {
                 tokens: max_concurrent as f64,
                 last_refill_at: None,
@@ -117,11 +131,7 @@ impl ProviderRequestQueue {
         F: Fn() -> Fut,
         Fut: Future<Output = Result<Response, reqwest::Error>>,
     {
-        let _permit = self
-            .semaphore
-            .acquire()
-            .await
-            .map_err(|e| format!("Queue for '{}' closed: {e}", self.provider_id))?;
+        let _slot = self.acquire_slot().await?;
 
         let mut attempt = 0;
         loop {
@@ -192,6 +202,19 @@ impl ProviderRequestQueue {
         }
     }
 
+    async fn acquire_slot(
+        &self,
+    ) -> Result<(Option<SemaphorePermit<'_>>, SemaphorePermit<'_>), String> {
+        let closed = |e| format!("Queue for '{}' closed: {e}", self.provider_id);
+        let background = if is_background() {
+            Some(self.background.acquire().await.map_err(closed)?)
+        } else {
+            None
+        };
+        let permit = self.semaphore.acquire().await.map_err(closed)?;
+        Ok((background, permit))
+    }
+
     pub async fn wait_for_slot(&self) {
         loop {
             let sleep_duration = {
@@ -259,6 +282,35 @@ impl ProviderRequestQueue {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn background_requests_leave_a_slot_for_the_foreground() {
+        let queue = Arc::new(ProviderRequestQueue::new(
+            "test_prov",
+            ProviderQueueConfig::default().with_max_concurrent(3),
+        ));
+        let mut prefetches = Vec::new();
+        for _ in 0..6 {
+            let q = queue.clone();
+            prefetches.push(tokio::spawn(in_background(async move {
+                let _slot = q.acquire_slot().await.unwrap();
+                sleep(Duration::from_millis(400)).await;
+            })));
+        }
+        sleep(Duration::from_millis(50)).await;
+
+        let started = Instant::now();
+        let _slot = queue.acquire_slot().await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "foreground waited {:?} behind prefetch",
+            started.elapsed()
+        );
+        drop(_slot);
+        for task in prefetches {
+            task.await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn test_provider_queue_concurrency_and_spacing() {
@@ -396,6 +448,7 @@ mod tests {
             file_prefix: None,
             image_prefix: None,
             is_custom: false,
+            ..Default::default()
         };
 
         let coomer = CoomerProvider::new(dummy_conf("coomer")).unwrap();

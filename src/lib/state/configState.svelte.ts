@@ -33,6 +33,18 @@ export class ConfigState {
     auto_check_updates: true,
     include_prereleases: false,
     scroll_edge_mask: true,
+    network_api_user_agent: '',
+    network_browser_user_agent: '',
+    network_timeout_secs: 0,
+    network_connect_timeout_secs: 0,
+    provider_deadline_secs: 0,
+    window_background_color: '#0c0e14',
+    linux_transparent_window: false,
+    cloud_timeout_secs: 0,
+    cloud_max_redirects: 0,
+    cloud_scraping_enabled: true,
+    cloud_user_agent: '',
+    cloud_proxy_url: '',
     titlebar_style: 'auto',
     download_group_by_creator: true,
     download_creator_folder_template: '{creator}',
@@ -65,7 +77,10 @@ export class ConfigState {
     if (newSettings.panic_button_enabled === undefined) {
       newSettings.panic_button_enabled = true;
     }
-    if (newSettings.providers && Array.isArray(newSettings.providers)) {
+    // Providers save separately; a settings copy taken before an edit must not roll them back.
+    if (providerState.providers.length > 0) {
+      newSettings.providers = providerState.providers;
+    } else if (Array.isArray(newSettings.providers)) {
       providerState.providers = newSettings.providers;
     }
     this.settings = newSettings;

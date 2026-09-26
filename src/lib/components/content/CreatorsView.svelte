@@ -19,7 +19,7 @@
   import CountBadge from '$lib/components/ui/CountBadge.svelte';
   import StickyHeader from '$lib/components/layout/StickyHeader.svelte';
   import { apiSaveSettings, apiSetCreatorFavorite } from '$lib/utils/ipc';
-  import { creatorAvatarSrc, creatorPlaceholderUrl, formatProviderName } from '$lib/utils/media';
+  import { creatorAvatarSrc, creatorPlaceholderUrl, formatProviderName, onAvatarError, onAvatarLoad } from '$lib/utils/media';
   import { notify } from '$lib/utils/toast';
   import { tooltip, ripple } from '$lib/motion';
   import { selectionState } from '$lib/state/selectionState.svelte';
@@ -800,9 +800,8 @@
               alt=""
               loading="lazy"
               decoding="async"
-              onerror={(e) => {
-                (e.currentTarget as HTMLImageElement).style.display = 'none';
-              }}
+              onload={onAvatarLoad}
+              onerror={onAvatarError}
             />
           {/if}
 

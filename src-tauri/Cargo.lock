@@ -3283,7 +3283,7 @@ dependencies = [
 
 [[package]]
 name = "pawstash"
-version = "26.9.1"
+version = "26.9.2"
 dependencies = [
  "aes",
  "anyhow",
@@ -3302,12 +3302,15 @@ dependencies = [
  "dunce",
  "flate2",
  "futures-util",
+ "httparse",
  "jni",
  "keyring",
+ "libc",
  "mime_guess",
  "rand 0.8.7",
  "reqwest 0.12.28",
  "rusqlite",
+ "rustls-native-certs",
  "scraper",
  "serde",
  "serde_json",
@@ -3323,12 +3326,15 @@ dependencies = [
  "tauri-plugin-os",
  "tauri-plugin-single-instance",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
  "urlencoding",
  "uuid",
+ "webpki-roots",
+ "windows-registry",
  "windows-sys 0.61.2",
 ]
 
@@ -4108,6 +4114,7 @@ version = "0.23.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",

@@ -139,10 +139,6 @@
     padding-top: calc(var(--mobile-status-bar-height) + 12px);
   }
 
-  .page-scroll-wrapper {
-    transition: -webkit-mask-image 0.25s cubic-bezier(0.16, 1, 0.3, 1), mask-image 0.25s cubic-bezier(0.16, 1, 0.3, 1);
-  }
-
   .page-scroll-wrapper.mask-both {
     -webkit-mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.2) 0px, black 120px, black calc(100% - 40px), rgba(0, 0, 0, 0.2) 100%);
     mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.2) 0px, black 120px, black calc(100% - 40px), rgba(0, 0, 0, 0.2) 100%);

@@ -4,6 +4,7 @@
   import { apiResolveCloudLink } from '$lib/utils/ipc';
   import { formatBytes } from '$lib/utils/formatters';
   import { logger } from '$lib/utils/logger';
+  import { configState } from '$lib/state/configState.svelte';
   import CloudFolderModal from './CloudFolderModal.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import CountBadge from '$lib/components/ui/CountBadge.svelte';
@@ -22,11 +23,9 @@
   let resolvedData = $state<CloudFolderResult | null>(null);
   let error = $state<string | null>(null);
   let modalOpen = $state(false);
+  let scrapingEnabled = $derived(configState.settings.cloud_scraping_enabled !== false);
 
-  let providerName = $derived.by(() => {
-    if (!resolvedData?.provider) return 'Cloud';
-    return resolvedData.provider;
-  });
+  let providerName = $derived(resolvedData?.provider || i18n.t('post.cloud_generic'));
 
   let providerBadgeClass = $derived.by(() => {
     const p = providerName.toLowerCase();
@@ -37,7 +36,7 @@
   });
 
   async function resolveLink(openModalAfter = false) {
-    if (loading) return;
+    if (loading || !scrapingEnabled) return;
     if (resolvedData) {
       if (openModalAfter) modalOpen = true;
       return;
@@ -48,8 +47,8 @@
       const res = await apiResolveCloudLink(url);
       resolvedData = res;
       if (openModalAfter) modalOpen = true;
-    } catch (err: any) {
-      error = typeof err === 'string' ? err : err?.message || 'Failed to resolve cloud link';
+    } catch (err) {
+      error = i18n.t('post.cloud_resolve_failed');
       logger.warn(`Cloud link resolution failed for ${url}`, err);
     } finally {
       loading = false;
@@ -57,7 +56,7 @@
   }
 
   $effect(() => {
-    if (url && !resolvedData && !loading && !error) {
+    if (scrapingEnabled && url && !resolvedData && !loading && !error) {
       void resolveLink(false);
     }
   });
@@ -86,13 +85,17 @@
         <div class="text-[13px] font-medium text-[var(--fg-default)] truncate max-w-[320px]">
           {url}
         </div>
-        {#if error}
+        {#if !scrapingEnabled}
+          <div class="text-[11.5px] text-[var(--fg-muted)] mt-0.5">
+            {i18n.t('post.cloud_scraping_off')}
+          </div>
+        {:else if error}
           <div class="text-[11px] text-[var(--danger,red)] truncate mt-0.5">
             {error}
           </div>
         {:else}
           <div class="text-[11.5px] text-[var(--fg-muted)] mt-0.5">
-            {loading ? 'Inspecting files...' : 'Click to inspect files'}
+            {loading ? i18n.t('post.cloud_inspecting') : i18n.t('post.cloud_inspect_hint')}
           </div>
         {/if}
       {/if}
@@ -100,20 +103,22 @@
   </div>
 
   <div class="actions flex items-center gap-2 shrink-0">
-    <Button
-      variant={resolvedData ? 'accent' : 'primary'}
-      size="sm"
-      onclick={() => resolveLink(true)}
-      disabled={loading}
-    >
-      {#if loading}
-        <IconSpinner class="w-3.5 h-3.5 mr-1.5 animate-spin" />
-        <span>Loading...</span>
-      {:else}
-        <IconFolder class="w-3.5 h-3.5 mr-1.5" />
-        <span>{resolvedData ? 'Browse' : 'Inspect'}</span>
-      {/if}
-    </Button>
+    {#if scrapingEnabled || resolvedData}
+      <Button
+        variant={resolvedData ? 'accent' : 'primary'}
+        size="sm"
+        onclick={() => resolveLink(true)}
+        disabled={loading}
+      >
+        {#if loading}
+          <IconSpinner class="w-3.5 h-3.5 mr-1.5 animate-spin" />
+          <span>{i18n.t('common.loading')}</span>
+        {:else}
+          <IconFolder class="w-3.5 h-3.5 mr-1.5" />
+          <span>{resolvedData ? i18n.t('post.cloud_browse') : i18n.t('post.cloud_inspect')}</span>
+        {/if}
+      </Button>
+    {/if}
 
     <a
       href={url}

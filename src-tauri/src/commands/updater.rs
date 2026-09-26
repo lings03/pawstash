@@ -76,8 +76,9 @@ fn strip_redundant_release_heading(body: &str) -> String {
 #[tauri::command]
 pub async fn check_for_updates(include_prereleases: bool) -> Result<UpdateInfo, String> {
     let current_version = env!("CARGO_PKG_VERSION").to_string();
-    let client = crate::net::builder()
+    let client = crate::net::builder_proxied()
         .user_agent(USER_AGENT)
+        .timeout(crate::net::defaults().request_timeout)
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 
@@ -242,8 +243,9 @@ pub async fn download_and_install_update(
     };
     let target_path = temp_dir.join(&safe_name);
 
-    let client = crate::net::builder()
+    let client = crate::net::builder_proxied()
         .user_agent(USER_AGENT)
+        .read_timeout(crate::net::defaults().request_timeout)
         .no_gzip()
         .build()
         .map_err(|e| format!("HTTP Client error: {e}"))?;

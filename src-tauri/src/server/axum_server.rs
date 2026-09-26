@@ -67,22 +67,11 @@ impl MediaServerState {
         }
     }
 
-    fn proxy_fingerprint(settings: &crate::config::AppSettings) -> String {
-        format!(
-            "{:?}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
-            settings.proxy_mode,
-            settings.proxy_url.trim(),
-            settings.proxy_username,
-            settings.proxy_password,
-            settings.proxy_bypass_local
-        )
-    }
-
     async fn upstream_clients(
         &self,
         settings: &crate::config::AppSettings,
     ) -> Result<(reqwest::Client, reqwest::Client), String> {
-        let fingerprint = Self::proxy_fingerprint(settings);
+        let fingerprint = crate::net::client_fingerprint(settings);
         if let Some(cached) = self.proxy_client.read().await.as_ref() {
             if cached.fingerprint == fingerprint {
                 return Ok((
@@ -93,12 +82,12 @@ impl MediaServerState {
         }
 
         let base = || -> Result<reqwest::ClientBuilder, String> {
-            Ok(crate::net::builder_with_proxy(settings)?
+            Ok(crate::cloud::external_links_builder(settings)?
                 .no_gzip()
                 .no_brotli()
                 .no_deflate()
-                .timeout(Duration::from_secs(60))
-                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"))
+                // No total timeout: it would cut long streams. A stalled read is what's dead.
+                .read_timeout(crate::net::defaults().request_timeout))
         };
 
         let manual_redirect = base()?
@@ -106,7 +95,12 @@ impl MediaServerState {
             .build()
             .map_err(|e| e.to_string())?;
         let follow_redirect = base()?
-            .redirect(reqwest::redirect::Policy::limited(10))
+            .redirect(reqwest::redirect::Policy::limited(
+                match settings.cloud_max_redirects {
+                    0 => crate::cloud::DEFAULT_CLOUD_MAX_REDIRECTS,
+                    value => value,
+                } as usize,
+            ))
             .build()
             .map_err(|e| e.to_string())?;
 

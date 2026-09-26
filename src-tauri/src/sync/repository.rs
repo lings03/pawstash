@@ -905,7 +905,36 @@ impl SyncRepository {
     ) -> Result<(), String> {
         let mut connection = self.connection.lock().map_err(|e| e.to_string())?;
         let tx = connection.transaction().map_err(|e| e.to_string())?;
+        Self::apply_change(&tx, record_id, kind, revision, plaintext, tombstone)?;
+        tx.commit()
+            .map_err(|e| format!("Failed to commit sync change ({record_id}): {e}"))
+    }
 
+    pub fn apply_remote_changes(&self, changes: &[RemoteApply<'_>]) -> Result<(), String> {
+        let mut connection = self.connection.lock().map_err(|e| e.to_string())?;
+        let tx = connection.transaction().map_err(|e| e.to_string())?;
+        for change in changes {
+            Self::apply_change(
+                &tx,
+                change.record_id,
+                change.kind,
+                change.revision,
+                change.plaintext.as_deref(),
+                change.tombstone,
+            )?;
+        }
+        tx.commit()
+            .map_err(|e| format!("Failed to commit {} sync changes: {e}", changes.len()))
+    }
+
+    fn apply_change(
+        tx: &rusqlite::Transaction<'_>,
+        record_id: &str,
+        kind: &str,
+        revision: i64,
+        plaintext: Option<&[u8]>,
+        tombstone: bool,
+    ) -> Result<(), String> {
         if tombstone {
             match kind {
                 "collection" => {
@@ -997,8 +1026,6 @@ impl SyncRepository {
                 params![record_id, kind, revision],
             )
             .map_err(|e| format!("Failed to update tombstone sync_records ({record_id}): {e}"))?;
-            tx.commit()
-                .map_err(|e| format!("Failed to commit tombstone ({record_id}): {e}"))?;
             return Ok(());
         }
 
@@ -1226,7 +1253,15 @@ impl SyncRepository {
                      ON CONFLICT(service,creator_id) DO UPDATE SET
                        name=coalesce(excluded.name, creators.name),
                        snapshot_json=excluded.snapshot_json",
-                    params![rec.service, rec.creator_id, rec.name, rec.snapshot_json],
+                    params![
+                        rec.service,
+                        rec.creator_id,
+                        rec.name,
+                        serde_json::from_str::<serde_json::Value>(&rec.snapshot_json)
+                            .ok()
+                            .and_then(|json| crate::db::storage::snapshot_json(&json).ok())
+                            .unwrap_or(rec.snapshot_json)
+                    ],
                 )
                 .map_err(|e| {
                     format!("Failed to insert/update creator for fav_creator ({record_id}): {e}")
@@ -1255,11 +1290,16 @@ impl SyncRepository {
             params![record_id, kind, revision, hash],
         )
         .map_err(|e| format!("Failed to update sync_records ({record_id}): {e}"))?;
-
-        tx.commit()
-            .map_err(|e| format!("Failed to commit sync change ({record_id}): {e}"))?;
         Ok(())
     }
+}
+
+pub struct RemoteApply<'a> {
+    pub record_id: &'a str,
+    pub kind: &'a str,
+    pub revision: i64,
+    pub plaintext: Option<Vec<u8>>,
+    pub tombstone: bool,
 }
 
 fn collect<T, F>(connection: &Connection, sql: &str, mapper: F) -> Result<Vec<T>, String>

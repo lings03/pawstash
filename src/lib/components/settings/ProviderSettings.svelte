@@ -16,7 +16,12 @@
     apiGetProviderAuthSchema,
     apiLogoutProviderSession,
     apiSyncProviderFavorites,
-    apiOpenAppLinksSettings
+    apiOpenAppLinksSettings,
+    apiGetNetworkDefaults,
+    FALLBACK_NETWORK_DEFAULTS,
+    apiGetProviderNetworkDefaults,
+    type NetworkDefaults,
+    type ProviderNetworkDefaults
   } from '$lib/utils/ipc';
   import type { ProviderConfig, ProviderAuthSchema } from '$lib/types/provider';
   import type { AppSettings } from '$lib/types/config';
@@ -38,8 +43,14 @@
   import IconPower from '~icons/fluent/power-24-regular';
   import IconLink from '~icons/fluent/link-24-regular';
   import IconOpen from '~icons/fluent/open-24-regular';
+  import IconGauge from '~icons/fluent/gauge-24-regular';
+  import IconCode from '~icons/fluent/code-24-regular';
+  import IconArrowRouting from '~icons/fluent/arrow-routing-24-regular';
+  import NumberStepper from '$lib/components/ui/NumberStepper.svelte';
 
   let defaultSettings = $state<AppSettings>({ ...configState.settings });
+  let networkDefaults = $state<NetworkDefaults>({ ...FALLBACK_NETWORK_DEFAULTS });
+  let providerDefaults = $state<Record<string, ProviderNetworkDefaults>>({});
   let authSchemas = $state<Record<string, ProviderAuthSchema>>({});
   let activeAuthModalProvider = $state<ProviderConfig | null>(null);
   let logoutConfirmProvider = $state<ProviderConfig | null>(null);
@@ -51,6 +62,14 @@
       defaultSettings = await apiGetDefaultSettings();
     } catch (err) {
       logger.warn('[ProviderSettings] Failed to fetch default settings:', err);
+    }
+    try {
+      [networkDefaults, providerDefaults] = await Promise.all([
+        apiGetNetworkDefaults(),
+        apiGetProviderNetworkDefaults()
+      ]);
+    } catch (err) {
+      logger.warn('[ProviderSettings] Failed to fetch network defaults:', err);
     }
     if (providerState.providers.length === 0) {
       await providerState.loadProviders();
@@ -81,6 +100,17 @@
     contentState.clearAllCache();
     void feedState.refresh();
     void creatorsState.refresh();
+  }
+
+  async function handleUpdateNetwork(
+    provider: ProviderConfig,
+    patch: Partial<ProviderConfig>
+  ) {
+    try {
+      await providerState.updateProvider({ ...provider, ...patch });
+    } catch (e) {
+      notify.error(i18n.t('settings.save_failed'), e);
+    }
   }
 
   async function handleUpdateApiUrl(provider: ProviderConfig, raw: string) {
@@ -149,7 +179,13 @@
     const updated: ProviderConfig = {
       ...provider,
       enabled: defProv?.enabled ?? true,
-      api_url: defProv?.api_url ?? provider.api_url
+      api_url: defProv?.api_url ?? provider.api_url,
+      advanced_network: false,
+      user_agent: '',
+      timeout_secs: 0,
+      proxy_url: '',
+      max_retries: 0,
+      min_interval_ms: 0
     };
     await providerState.updateProvider(updated);
     if (provider.id === 'pawchive') {
@@ -265,6 +301,122 @@
           />
         </div>
       </SettingItem>
+
+      <SettingItem
+        title={i18n.t('settings.provider_advanced_network')}
+        description={i18n.t('settings.provider_advanced_network_desc')}
+        icon={IconGauge}
+        align="right"
+        value={provider.advanced_network ?? false}
+        defaultValue={false}
+        onReset={() => void handleUpdateNetwork(provider, { advanced_network: false })}
+      >
+        <Toggle
+          checked={provider.advanced_network ?? false}
+          ariaLabel={i18n.t('settings.provider_advanced_network')}
+          onchange={(value) => handleUpdateNetwork(provider, { advanced_network: value })}
+        />
+      </SettingItem>
+
+      {#if provider.advanced_network}
+        <SettingItem
+          title={i18n.t('settings.provider_user_agent')}
+          description={i18n.t('settings.provider_user_agent_desc')}
+          icon={IconCode}
+          value={provider.user_agent ?? ''}
+          defaultValue={''}
+          onReset={() => void handleUpdateNetwork(provider, { user_agent: '' })}
+        >
+          <div class="w-full">
+            <Input
+              clearable={true}
+              value={provider.user_agent ?? ''}
+              placeholder={configState.settings.network_api_user_agent || networkDefaults.api_user_agent}
+              onchange={(e) =>
+                handleUpdateNetwork(provider, {
+                  user_agent: (e.target as HTMLInputElement).value
+                })}
+            />
+          </div>
+        </SettingItem>
+
+        <SettingItem
+          title={i18n.t('settings.provider_timeout')}
+          description={i18n.t('settings.provider_timeout_desc')}
+          icon={IconGauge}
+          align="right"
+          value={provider.timeout_secs ?? 0}
+          defaultValue={0}
+          onReset={() => void handleUpdateNetwork(provider, { timeout_secs: 0 })}
+        >
+          <NumberStepper
+            value={provider.timeout_secs ||
+              configState.settings.network_timeout_secs ||
+              networkDefaults.request_timeout_secs}
+            min={5}
+            max={600}
+            step={5}
+            onchange={(value) => handleUpdateNetwork(provider, { timeout_secs: value })}
+          />
+        </SettingItem>
+
+        <SettingItem
+          title={i18n.t('settings.provider_proxy_url')}
+          description={i18n.t('settings.provider_proxy_url_desc')}
+          icon={IconArrowRouting}
+          value={provider.proxy_url ?? ''}
+          defaultValue={''}
+          onReset={() => void handleUpdateNetwork(provider, { proxy_url: '' })}
+        >
+          <div class="w-full">
+            <Input
+              clearable={true}
+              value={provider.proxy_url ?? ''}
+              placeholder={i18n.t('settings.inherits_global_proxy')}
+              onchange={(e) =>
+                handleUpdateNetwork(provider, {
+                  proxy_url: (e.target as HTMLInputElement).value
+                })}
+            />
+          </div>
+        </SettingItem>
+
+        <SettingItem
+          title={i18n.t('settings.provider_max_retries')}
+          description={i18n.t('settings.provider_max_retries_desc')}
+          icon={IconArrowSync}
+          align="right"
+          value={provider.max_retries ?? 0}
+          defaultValue={0}
+          onReset={() => void handleUpdateNetwork(provider, { max_retries: 0 })}
+        >
+          <NumberStepper
+            value={provider.max_retries || providerDefaults[provider.id]?.max_retries || 3}
+            min={1}
+            max={10}
+            step={1}
+            onchange={(value) => handleUpdateNetwork(provider, { max_retries: value })}
+          />
+        </SettingItem>
+
+        <SettingItem
+          title={i18n.t('settings.provider_min_interval')}
+          description={i18n.t('settings.provider_min_interval_desc')}
+          icon={IconGauge}
+          align="right"
+          value={provider.min_interval_ms ?? 0}
+          defaultValue={0}
+          onReset={() => void handleUpdateNetwork(provider, { min_interval_ms: 0 })}
+        >
+          <NumberStepper
+            value={provider.min_interval_ms || providerDefaults[provider.id]?.min_interval_ms || 100}
+            min={10}
+            max={5000}
+            step={50}
+            onchange={(value) => handleUpdateNetwork(provider, { min_interval_ms: value })}
+          />
+        </SettingItem>
+      {/if}
 
       {#if schema?.supports_auth}
         <SettingItem

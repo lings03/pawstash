@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import type { Post } from '$lib/types/content';
   import type { LibraryCollection } from '$lib/types/library';
   import { configState } from '$lib/state/configState.svelte';
@@ -9,13 +10,16 @@
   import { selectionState } from '$lib/state/selectionState.svelte';
   import { accountState } from '$lib/state/accountState.svelte';
   import { subscriptionState } from '$lib/state/subscriptionState.svelte';
+  import { playbackState } from '$lib/state/playbackState.svelte';
   import { i18n } from '$lib/i18n';
   import { tooltip, ripple } from '$lib/motion';
   import { notify } from '$lib/utils/toast';
   import { notifyAddedToStash, notifyRemovedFromStash } from '$lib/utils/stashToast';
   import { formatDate, cleanPostTitle } from '$lib/utils/formatters';
-  import { isVideoUrl, postMediaUrl, postThumbnailSrc, postPlaceholderUrl, getPostFileCounts, isPostUnarchived } from '$lib/utils/media';
+  import { isVideoUrl, isAttachmentVideo, postMediaUrl, postThumbnailSrc, postPlaceholderUrl, getPostFileCounts, isPostUnarchived } from '$lib/utils/media';
   import { getMediaThumbnail, cancelMediaThumbnail } from '$lib/utils/mediaThumbnail';
+  import { thumbnailKey } from '$lib/utils/cacheKey';
+  import { extraField } from '$lib/utils/fields';
   import { apiSetPostFavorite } from '$lib/utils/ipc';
   import ServiceIcon from './ServiceIcon.svelte';
   import Select from '$lib/components/ui/Select.svelte';
@@ -75,22 +79,52 @@
   let mediaUrl = $derived(postMediaUrl(effectivePost));
   let thumbnailUrl = $derived(postThumbnailSrc(effectivePost));
   let placeholderUrl = $derived(postPlaceholderUrl(effectivePost));
-  let video = $derived(isVideoUrl(mediaUrl));
+  let isVideo = $derived(
+    isVideoUrl(mediaUrl) ||
+    isAttachmentVideo(effectivePost?.file, mediaUrl) ||
+    Boolean(effectivePost?.attachments?.some((a) => isAttachmentVideo(a, a.url)))
+  );
+  let isAnimated = $derived(
+    Boolean(
+      isVideo ||
+      (thumbnailUrl && (thumbnailUrl.includes('preview.webp') || /\.gif(?:$|\?)/i.test(thumbnailUrl)))
+    )
+  );
 
   let generatedThumbnail = $state<string | null>(null);
+  let frozenThumbnail = $state<string | null>(null);
+
+  function freezeFrame(target: HTMLImageElement) {
+    if (frozenThumbnail) return;
+    try {
+      const w = target.naturalWidth || target.width;
+      const h = target.naturalHeight || target.height;
+      if (!w || !h) return;
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.min(360, w);
+      canvas.height = Math.max(1, Math.round(canvas.width * (h / w)));
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.drawImage(target, 0, 0, canvas.width, canvas.height);
+      const data = canvas.toDataURL('image/jpeg', 0.85);
+      if (data && data.length > 50) {
+        frozenThumbnail = data;
+      }
+    } catch {}
+  }
 
   $effect(() => {
-    if (thumbnailUrl) {
+    if (thumbnailUrl && !isAnimated) {
       generatedThumbnail = null;
       return;
     }
     if (!effectivePost?.service || !effectivePost?.user || !effectivePost?.id) return;
-    const key = `post:${effectivePost.service}:${effectivePost.user}:${effectivePost.id}`;
+    const key = thumbnailKey(null, effectivePost);
     const url = effectivePost.thumbnail_url || effectivePost.file?.thumbnail_url || mediaUrl || effectivePost.file?.path;
     if (!url) return;
 
     let cancelled = false;
-    getMediaThumbnail(key, url, video ? 'video' : 'image', 360).then((thumb) => {
+    getMediaThumbnail(key, url, isVideo ? 'video' : 'image', 360).then((thumb) => {
       if (!cancelled && thumb) {
         generatedThumbnail = thumb;
       }
@@ -103,6 +137,51 @@
   });
 
   let activeThumbnail = $derived(thumbnailUrl || generatedThumbnail);
+  let idleThumbnail = $derived(
+    frozenThumbnail ||
+    (isAnimated && generatedThumbnail ? generatedThumbnail : null) ||
+    activeThumbnail
+  );
+
+  let isHovered = $state(false);
+  let showVideo = $state(false);
+  let hoverVideoFailed = $state(false);
+  let videoEl = $state<HTMLVideoElement | null>(null);
+  let playTimeout: ReturnType<typeof setTimeout> | undefined;
+
+  let hoverVideoUrl = $derived.by(() => {
+    if (isVideo && mediaUrl) return mediaUrl;
+    if (thumbnailUrl && (thumbnailUrl.includes('preview.webp') || /\.gif(?:$|\?)/i.test(thumbnailUrl))) {
+      return thumbnailUrl;
+    }
+    return undefined;
+  });
+
+  function handleCardMouseEnter() {
+    isHovered = true;
+    handleCardHover();
+    if (hoverVideoUrl && !hoverVideoFailed) {
+      if (playTimeout) clearTimeout(playTimeout);
+      playTimeout = setTimeout(() => {
+        if (isHovered) {
+          showVideo = true;
+        }
+      }, 180);
+    }
+  }
+
+  function handleCardMouseLeave() {
+    isHovered = false;
+    if (playTimeout) clearTimeout(playTimeout);
+    showVideo = false;
+    if (videoEl) {
+      videoEl.pause();
+    }
+  }
+
+  onDestroy(() => {
+    if (playTimeout) clearTimeout(playTimeout);
+  });
 
   let isLite = $derived(configState.settings.card_view_mode === 'lite');
   let fileCounts = $derived(getPostFileCounts(effectivePost));
@@ -179,18 +258,12 @@
     }
   }
 
-  let isLocked = $derived.by(() => {
-    const extra = post.extra as any;
-    return Boolean(extra?.is_locked || (extra?.locked_attachments_count && extra.locked_attachments_count > 0));
-  });
-  let lockedCount = $derived.by(() => {
-    const extra = post.extra as any;
-    return (extra?.locked_attachments_count as number) || 0;
-  });
+  let lockedCount = $derived(Number(extraField(post, 'locked_attachments_count')) || 0);
+  let isLocked = $derived(Boolean(extraField(post, 'is_locked')) || lockedCount > 0);
   let textContent = $derived.by(() => {
     return (post.content || post.substring || '').trim();
   });
-  let isTextOnly = $derived(!thumbnailUrl && !mediaUrl && !video && fileCounts.total === 0 && textContent.length > 0);
+  let isTextOnly = $derived(!thumbnailUrl && !mediaUrl && !isVideo && fileCounts.total === 0 && textContent.length > 0);
 
   let imageLoaded = $state(false);
   let imageError = $state(false);
@@ -260,13 +333,10 @@
   });
 
   let creatorName = $derived.by(() => {
-    const extra = post.extra as any;
-    if (extra?.creator_name) return extra.creator_name;
-    if (extra?.creatorName) return extra.creatorName;
-    if (extra?.username) return extra.username;
-    if (extra?.user_name) return extra.user_name;
-    if (extra?.author) return extra.author;
-    if (extra?.name) return extra.name;
+    for (const key of ['creator_name', 'creatorName', 'username', 'user_name', 'author', 'name']) {
+      const value = extraField<string>(post, key);
+      if (value) return value;
+    }
 
     const serviceLower = (post.service || '').toLowerCase();
     const userIdLower = (post.user || '').toLowerCase();
@@ -331,7 +401,7 @@
 
   function handleCardHover() {
     if (post?.service && post?.user && post?.id && !effectivePost.detail_fetched) {
-      void contentState.loadPost(post.service, post.user, post.id);
+      contentState.enqueueDetailPrefetch(post.service, post.user, post.id, true);
     }
   }
 
@@ -410,7 +480,8 @@
   style:aspect-ratio={ratio}
   style:--tile-enter-delay={enterDelay !== null ? `${enterDelay}ms` : null}
   data-post-key={postKey}
-  onmouseenter={handleCardHover}
+  onmouseenter={handleCardMouseEnter}
+  onmouseleave={handleCardMouseLeave}
 >
   <button
     class="grid-tile-open"
@@ -578,15 +649,18 @@
     />
   {/if}
 
-  {#if activeThumbnail}
+  {#if idleThumbnail}
     <img
       class="grid-tile-media"
-      src={activeThumbnail}
+      src={idleThumbnail}
       alt=""
       loading="lazy"
       decoding="async"
-      onload={() => {
+      onload={(e) => {
         imageLoaded = true;
+        if (isAnimated) {
+          freezeFrame(e.currentTarget as HTMLImageElement);
+        }
       }}
       onerror={(e) => {
         const target = e.currentTarget as HTMLImageElement;
@@ -599,7 +673,7 @@
         }
       }}
     />
-  {:else if video}
+  {:else if isVideo}
     <div class="grid-tile-placeholder"><IconVideo /></div>
   {:else if mediaUrl}
     <img class="grid-tile-media" src={mediaUrl} alt="" loading="lazy" decoding="async" />
@@ -617,6 +691,37 @@
     </div>
   {:else}
     <div class="grid-tile-placeholder"><IconImage /></div>
+  {/if}
+
+  {#if showVideo && hoverVideoUrl && !hoverVideoFailed}
+    {#if isVideoUrl(hoverVideoUrl)}
+      <video
+        bind:this={videoEl}
+        class="grid-tile-media grid-tile-hover-video"
+        src={hoverVideoUrl}
+        muted
+        loop
+        playsinline
+        disablepictureinpicture
+        disableremoteplayback
+        autoplay
+        onloadedmetadata={(e) => {
+          const vid = e.currentTarget as HTMLVideoElement;
+          if (vid.duration && isFinite(vid.duration) && vid.duration > 0) {
+            const key = effectivePost?.id || '';
+            if (key) playbackState.saveDuration(key, vid.duration);
+          }
+        }}
+        onerror={() => { hoverVideoFailed = true; showVideo = false; }}
+      ></video>
+    {:else}
+      <img
+        class="grid-tile-media grid-tile-hover-video"
+        src={hoverVideoUrl}
+        alt=""
+        aria-hidden="true"
+      />
+    {/if}
   {/if}
 
   <div class="grid-tile-shade"></div>
@@ -739,5 +844,9 @@
   .grid-tile-placeholder-locked {
     flex-direction: column;
     gap: 0.35rem;
+  }
+
+  :global(.grid-tile-hover-video) {
+    pointer-events: none !important;
   }
 </style>

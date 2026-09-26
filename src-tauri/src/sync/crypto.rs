@@ -11,7 +11,7 @@ use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
-const KEY_BYTES: usize = 32;
+pub const KEY_BYTES: usize = 32;
 const NONCE_BYTES: usize = 24;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

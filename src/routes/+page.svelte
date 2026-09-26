@@ -13,7 +13,7 @@
   import { layoutState } from '$lib/state/layoutState.svelte';
   import { creatorsState } from '$lib/state/creatorsState.svelte';
   import { providerState } from '$lib/state/providerState.svelte';
-  import { apiGetSettings, apiGetPendingDeepLink, apiShowMainWindow } from '$lib/utils/ipc';
+  import { apiGetSettings, apiGetPendingDeepLink, apiSetAppHidden, apiShowMainWindow } from '$lib/utils/ipc';
   import BackgroundProvider from '$lib/components/providers/BackgroundProvider.svelte';
   import DesktopTitlebar from '$lib/components/layout/DesktopTitlebar.svelte';
   import SidebarNav from '$lib/components/layout/SidebarNav.svelte';
@@ -31,6 +31,7 @@
   import { updateState } from '$lib/state/updateState.svelte';
   import { initFrontendLogging } from '$lib/utils/logger';
   import { initDeepLinkListener, handleDeepLinkUrl } from '$lib/utils/deepLink';
+  import { initRestartNotice } from '$lib/utils/restartNotice';
   import Toaster from '$lib/components/ui/Toaster.svelte';
   import pawstashLogo from '$lib/assets/pawstash.png';
   import { logoFlightState } from '$lib/state/logoFlightState.svelte';
@@ -88,6 +89,9 @@
     }
 
     const cleanupDeepLink = initDeepLinkListener();
+    const cleanupRestartNotice = initRestartNotice();
+    const reportVisibility = () => void apiSetAppHidden(document.hidden).catch(() => {});
+    document.addEventListener('visibilitychange', reportVisibility);
     void apiGetPendingDeepLink().then(handleDeepLinkPayload).catch(() => {});
     const unlistenDeepLink = listen<string>('open-post-deep-link', (event) => {
       handleDeepLinkPayload(event.payload);
@@ -103,6 +107,11 @@
     void apiGetSettings()
       .then((settings) => {
         configState.updateSettings(settings);
+        // Read once: transparency is fixed when the window is created.
+        document.documentElement.classList.toggle(
+          'opaque-window',
+          layoutState.isLinux && settings.linux_transparent_window !== true
+        );
         if (settings.auto_check_updates ?? true) {
           setTimeout(() => void updateState.check(true), 3000);
         }
@@ -125,6 +134,8 @@
       document.removeEventListener('touchstart', preventPinchZoom);
       document.removeEventListener('touchmove', preventPinchZoom);
       cleanupDeepLink();
+      cleanupRestartNotice();
+      document.removeEventListener('visibilitychange', reportVisibility);
       void unlistenDeepLink.then((u) => u());
       void unlistenPanic.then((u) => u());
     };

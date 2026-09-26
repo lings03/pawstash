@@ -12,7 +12,7 @@ import {
   type ContrastLevel,
   type SchemeVariant
 } from './palette';
-import { apiGetSystemAccentColor } from '$lib/utils/ipc';
+import { apiGetSystemAccentColor, apiSetWindowBackgroundColor } from '$lib/utils/ipc';
 import { logger } from '$lib/utils/logger';
 
 export interface SystemMonetPalette {
@@ -39,6 +39,7 @@ export class ThemeState {
   systemPalette = $state<SystemMonetPalette | null>(null);
   overrideAccent = $state<string | null>(null);
   systemPrefersDark = $state(true);
+  private lastWindowBackground: string | null = null;
 
   get isDark(): boolean {
     if (this.tokens.colorMode === 'system') return this.systemPrefersDark;
@@ -336,13 +337,16 @@ export class ThemeState {
     root.style.setProperty('--backdrop-blur', `${this.tokens.backdropBlurPx}px`);
 
     root.style.setProperty('--bg-surface-hover', pal.surfaceContainerHigh);
+    let baseColor: string;
     if (this.tokens.surfaceStyle === 'oled' && this.isDark) {
-      root.style.setProperty('--bg-base', '#000000');
+      baseColor = '#000000';
       root.style.setProperty('--bg-surface', `rgba(${pal.surfaceLowRgb}, 0.95)`);
     } else {
-      root.style.setProperty('--bg-base', this.isDark ? '#0c0e14' : pal.surface);
+      baseColor = this.isDark ? '#0c0e14' : pal.surface;
       root.style.setProperty('--bg-surface', `rgba(${pal.surfaceLowRgb}, 0.7)`);
     }
+    root.style.setProperty('--bg-base', baseColor);
+    this.syncWindowBackground(baseColor);
 
     const userFont = this.tokens.fontFamily?.trim();
     if (userFont) {
@@ -356,6 +360,14 @@ export class ThemeState {
       root.style.removeProperty('--font-display');
       root.style.removeProperty('--font-outfit');
     }
+  }
+
+  private syncWindowBackground(color: string) {
+    if (!/^#[0-9a-f]{3,8}$/i.test(color) || color === this.lastWindowBackground) return;
+    this.lastWindowBackground = color;
+    void apiSetWindowBackgroundColor(color).catch((error) =>
+      logger.warn('Failed to sync window background colour', error)
+    );
   }
 
   private async transitionTheme(fn: () => void, event?: MouseEvent) {

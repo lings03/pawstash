@@ -1,7 +1,6 @@
 use crate::config::settings::AppSettings;
 use reqwest::{Client, StatusCode, Url};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::time::Duration;
 
 #[derive(Serialize)]
 pub struct CreateAccountRequest<'a> {
@@ -110,6 +109,8 @@ pub struct AcceptedRecord {
     pub position: i64,
 }
 
+pub const PULL_PAGE_LIMIT: usize = 500;
+
 pub struct SyncHttpClient {
     client: Client,
     base: String,
@@ -121,7 +122,8 @@ impl SyncHttpClient {
         if url.scheme() != "https" && !local {
             return Err("Sync server requires HTTPS".to_string());
         }
-        let builder = crate::net::builder_with_proxy(settings)?.timeout(Duration::from_secs(45));
+        let builder = crate::net::builder_with_proxy(settings)?
+            .timeout(crate::net::defaults().request_timeout);
         let base = format!("{}/v1", server_url.trim().trim_end_matches('/'));
         Ok(Self {
             client: builder.build().map_err(|e| e.to_string())?,
@@ -236,7 +238,7 @@ impl SyncHttpClient {
             self.client
                 .get(format!("{}/changes", self.base))
                 .bearer_auth(token)
-                .query(&[("after", after), ("limit", 500)]),
+                .query(&[("after", after), ("limit", PULL_PAGE_LIMIT as i64)]),
             StatusCode::OK,
         )
         .await

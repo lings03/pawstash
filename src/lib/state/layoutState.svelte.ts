@@ -5,6 +5,7 @@ export class LayoutState {
   isMobileDevice = typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod|IEMobile/i.test(navigator.userAgent);
   isAndroid = typeof navigator !== 'undefined' && /Android/i.test(navigator.userAgent);
   isMacOS = typeof navigator !== 'undefined' && /Macintosh|Mac OS X|MacPPC|MacIntel/i.test(navigator.userAgent);
+  isLinux = typeof navigator !== 'undefined' && /Linux|X11/i.test(navigator.userAgent) && !/Android/i.test(navigator.userAgent);
 
   constructor() {
     if (typeof window !== 'undefined') {

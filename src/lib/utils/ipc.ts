@@ -28,6 +28,9 @@ import type {
 } from '$lib/types/content';
 
 export const apiGetSystemAccentColor = () => invoke<string | null>('get_system_accent_color');
+
+export const apiSetWindowBackgroundColor = (color: string) =>
+  invoke<void>('set_window_background_color', { color });
 export interface MediaServerInfo {
   port: number;
   token: string;
@@ -36,6 +39,52 @@ export const apiGetAxumPort = () => invoke<MediaServerInfo>('get_axum_port');
 export const apiCheckAria2c = () => invoke<boolean>('check_aria2c_installed');
 export const apiGetSettings = () => invoke<AppSettings>('get_settings');
 export const apiGetDefaultSettings = () => invoke<AppSettings>('get_default_settings');
+
+export interface NetworkDefaults {
+  api_user_agent: string;
+  browser_user_agent: string;
+  request_timeout_secs: number;
+  connect_timeout_secs: number;
+  provider_deadline_secs: number;
+  cloud_timeout_secs: number;
+  cloud_max_redirects: number;
+}
+
+export const apiGetNetworkDefaults = () => invoke<NetworkDefaults>('get_network_defaults');
+
+export const FALLBACK_NETWORK_DEFAULTS: NetworkDefaults = {
+  api_user_agent: '',
+  browser_user_agent: '',
+  request_timeout_secs: 45,
+  connect_timeout_secs: 8,
+  provider_deadline_secs: 8,
+  cloud_timeout_secs: 30,
+  cloud_max_redirects: 10
+};
+
+export interface ProviderNetworkDefaults {
+  max_retries: number;
+  min_interval_ms: number;
+}
+
+export interface WebviewProxyStatus {
+  supported: boolean;
+  active: boolean;
+  needed: boolean;
+}
+
+export const apiGetWebviewProxyStatus = () =>
+  invoke<WebviewProxyStatus>('get_webview_proxy_status');
+
+export interface PendingRestart {
+  settings: Array<'webview_proxy' | 'browser_user_agent' | 'transparent_window'>;
+  can_restart: boolean;
+}
+
+export const apiRestartApp = () => invoke<void>('restart_app');
+
+export const apiGetProviderNetworkDefaults = () =>
+  invoke<Record<string, ProviderNetworkDefaults>>('get_provider_network_defaults');
 export interface CacheStats {
   total_bytes: number;
   metadata_bytes: number;
@@ -48,7 +97,9 @@ export interface CacheStats {
   other_bytes: number;
   file_count: number;
 }
+
 export const apiGetCacheStats = () => invoke<CacheStats>('get_cache_stats');
+export const apiSetAppHidden = (hidden: boolean) => invoke<void>('set_app_hidden', { hidden });
 export const apiClearContentCache = () => invoke<CacheStats>('clear_content_cache');
 export const apiClearAllContentCache = () => invoke<CacheStats>('clear_all_content_cache');
 export const apiWipeAllData = () => invoke<CacheStats>('wipe_all_data');
@@ -101,25 +152,40 @@ export const apiGetCreatorName = (service: string, creatorId: string) =>
 export const apiSyncCreators = () =>
   invoke<number>('sync_creators');
 
-export const apiFetchPosts = (service: string, userId: string, offset = 0) =>
-  invoke<Post[]>('fetch_posts', { service, userId, offset });
-
-export const apiFetchRecentPosts = (query?: string, offset = 0) =>
-  invoke<Post[]>('fetch_recent_posts', { query, offset });
+export const apiFetchRecentPosts = (query?: string, offset = 0, streamId?: string) =>
+  invoke<Post[]>('fetch_recent_posts', { query, offset, streamId });
 
 export const apiFetchPopularPosts = (
   period: string = 'day',
   date?: string,
-  offset = 0
-) => invoke<Post[]>('fetch_popular_posts', { period, date, offset });
+  offset = 0,
+  streamId?: string
+) => invoke<Post[]>('fetch_popular_posts', { period, date, offset, streamId });
+
+export interface PartialPostsEvent {
+  stream_id: string;
+  provider_id: string;
+  posts: Post[];
+}
 
 export const apiFetchCreatorPosts = (
   service: string,
   creatorId: string,
   query?: string,
   offset = 0,
-  providerId?: string
-) => invoke<Post[]>('fetch_creator_posts', { service, creatorId, query, offset, providerId });
+  providerId?: string,
+  forceRefresh?: boolean,
+  streamId?: string
+) =>
+  invoke<Post[]>('fetch_creator_posts', {
+    service,
+    creatorId,
+    query,
+    offset,
+    providerId,
+    forceRefresh,
+    streamId
+  });
 
 export const apiFetchCreatorProfile = (service: string, creatorId: string, providerId?: string) =>
   invoke<CreatorProfile>('fetch_creator_profile', { service, creatorId, providerId });
@@ -136,8 +202,13 @@ export const apiFetchCreatorLinks = (service: string, creatorId: string, provide
 export const apiFetchSimilarCreators = (service: string, creatorId: string, providerId?: string) =>
   invoke<CreatorProfile[]>('fetch_similar_creators', { service, creatorId, providerId });
 
-export const apiFetchPost = (service: string, creatorId: string, postId: string, providerId?: string) =>
-  invoke<Post>('fetch_post', { service, creatorId, postId, providerId });
+export const apiFetchPost = (
+  service: string,
+  creatorId: string,
+  postId: string,
+  providerId?: string,
+  prefetch?: boolean
+) => invoke<Post>('fetch_post', { service, creatorId, postId, providerId, prefetch });
 
 export const apiGetCachedPost = (service: string, creatorId: string, postId: string, providerId?: string) =>
   invoke<Post | null>('get_cached_post', { service, creatorId, postId, providerId });
@@ -305,6 +376,9 @@ export const apiResumeDownload = (downloadId: string) =>
   invoke<DownloadItem>('resume_download', { downloadId });
 export const apiRetryDownload = (downloadId: string) =>
   invoke<DownloadItem>('retry_download', { downloadId });
+export const apiPauseAllDownloads = () => invoke<void>('pause_all_downloads');
+export const apiResumeAllDownloads = () => invoke<void>('resume_all_downloads');
+export const apiCancelAllDownloads = () => invoke<void>('cancel_all_downloads');
 export const apiRemoveDownload = (downloadId: string) =>
   invoke<boolean>('remove_download', { downloadId });
 

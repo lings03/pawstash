@@ -11,31 +11,62 @@ use crate::config::AppSettings;
 use reqwest::Client;
 use std::time::Duration;
 
+/// Broader than the `supports_url` lists: Drive streams from `drive.usercontent.google.com`.
+pub const NETWORK_HOSTS: &[&str] = &[
+    "drive.google.com",
+    "docs.google.com",
+    "drive.usercontent.google.com",
+    "mega.nz",
+    "mega.co.nz",
+    "dropbox.com",
+    "dropboxusercontent.com",
+    "pixeldrain.com",
+    "iframely.net",
+    "iframely.com",
+    "iframe.ly",
+];
+
+pub const DEFAULT_CLOUD_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_CLOUD_MAX_REDIRECTS: u64 = 10;
+
 pub struct CloudResolver {
     client: Client,
 }
 
-impl Default for CloudResolver {
-    fn default() -> Self {
-        Self::new(None)
-    }
+pub fn external_links_builder(settings: &AppSettings) -> Result<reqwest::ClientBuilder, String> {
+    let proxy_override = settings.cloud_proxy_url.trim();
+    let builder = if proxy_override.is_empty() {
+        crate::net::builder_with_proxy(settings)?
+    } else {
+        let proxy = reqwest::Proxy::all(proxy_override)
+            .map_err(|e| format!("Invalid External Links proxy URL: {e}"))?;
+        crate::net::builder().proxy(proxy)
+    };
+    let user_agent = match settings.cloud_user_agent.trim() {
+        "" => crate::net::browser_user_agent(),
+        custom => custom.to_string(),
+    };
+    Ok(builder.user_agent(user_agent))
 }
 
 impl CloudResolver {
-    pub fn new(settings: Option<&AppSettings>) -> Self {
-        let mut builder = crate::net::builder();
-        if let Some(s) = settings {
-            builder = crate::net::apply_proxy(builder, s).unwrap_or_else(|_| crate::net::builder());
-        }
+    pub fn new(settings: &AppSettings) -> Result<Self, String> {
+        let timeout = match settings.cloud_timeout_secs {
+            0 => DEFAULT_CLOUD_TIMEOUT_SECS,
+            secs => secs,
+        };
+        let redirects = match settings.cloud_max_redirects {
+            0 => DEFAULT_CLOUD_MAX_REDIRECTS,
+            limit => limit,
+        };
 
-        let client = builder
-            .timeout(Duration::from_secs(30))
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36")
-            .redirect(reqwest::redirect::Policy::limited(10))
+        let client = external_links_builder(settings)?
+            .timeout(Duration::from_secs(timeout))
+            .redirect(reqwest::redirect::Policy::limited(redirects as usize))
             .gzip(true)
             .build()
-            .unwrap_or_else(|_| Client::new());
-        Self { client }
+            .map_err(|error| format!("Failed to build external-links client: {error}"))?;
+        Ok(Self { client })
     }
 
     pub async fn resolve(&self, url: &str) -> Result<CloudFolderResult, String> {

@@ -116,6 +116,7 @@ impl Aria2cManager {
         })?;
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(150));
         let rpc_client = reqwest::Client::builder()
+            .no_proxy()
             .timeout(std::time::Duration::from_millis(500))
             .build()
             .map_err(|error| DownloadRunError::Failed(error.to_string()))?;

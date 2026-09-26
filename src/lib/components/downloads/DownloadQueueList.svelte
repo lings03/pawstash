@@ -26,6 +26,7 @@
   import { ripple } from '$lib/motion';
   import DownloadItemCard from './DownloadItemCard.svelte';
   import DownloadGroupCard from './DownloadGroupCard.svelte';
+  import DownloadQueueTile from './DownloadQueueTile.svelte';
   import SkeletonGrid from '$lib/components/ui/SkeletonGrid.svelte';
   import { GridHandoff } from '$lib/motion/gridHandoff.svelte';
   import MediaViewer, { type MediaViewerItem, type MediaViewerKind } from '$lib/components/content/MediaViewer.svelte';
@@ -81,7 +82,9 @@
     formatFilters?: FilterMap;
   }>(navigationState.entryKey);
 
-  let groupByPosts = $state(savedState?.groupByPosts ?? false);
+  const GROUP_BY_POSTS_KEY = 'pawstash_downloads_group_by_posts';
+  const storedGroupByPosts = typeof localStorage !== 'undefined' && localStorage.getItem(GROUP_BY_POSTS_KEY) === 'true';
+  let groupByPosts = $state(savedState?.groupByPosts ?? storedGroupByPosts);
   let sortBy = $state<DownloadSort>(savedState?.sortBy ?? 'newest');
   let formatFilters = $state<FilterMap>(savedState?.formatFilters ?? {});
   let searchQuery = $state(savedState?.searchQuery ?? '');
@@ -116,8 +119,43 @@
       value: 'completed' as DownloadFilter,
       label: i18n.t('downloads.completed'),
       count: completedCount
+    }] : []),
+    ...(downloadState.failedDownloadsCount > 0 ? [{
+      value: 'failed' as DownloadFilter,
+      label: i18n.t('downloads.failed'),
+      count: downloadState.failedDownloadsCount
     }] : [])
   ]);
+
+  let anyRunning = $derived(downloadState.queueStats.downloading + downloadState.queueStats.queued > 0);
+  let anyPaused = $derived(downloadState.queueStats.paused > 0);
+  let showQueueTile = $derived(
+    downloadState.filter !== 'completed' &&
+      (downloadState.activeDownloadsCount > 0 || downloadState.failedDownloadsCount > 0)
+  );
+  let bulkBusy = $state(false);
+
+  async function runBulk(action: () => Promise<void>) {
+    if (bulkBusy) return;
+    bulkBusy = true;
+    try {
+      await action();
+    } catch (err) {
+      notify.error(i18n.t('downloads.action_error'), err);
+    } finally {
+      bulkBusy = false;
+    }
+  }
+
+  const toggleAllDownloads = () =>
+    runBulk(() => (anyRunning ? downloadState.pauseAll() : downloadState.resumeAll()));
+  const retryAllFailed = () => runBulk(() => downloadState.retryFailed());
+
+  $effect(() => {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(GROUP_BY_POSTS_KEY, String(groupByPosts));
+    }
+  });
 
   $effect(() => {
     navigationState.saveViewState(navigationState.entryKey, {
@@ -131,6 +169,12 @@
 
   $effect(() => {
     if (downloadState.filter === 'completed' && completedCount === totalCount) {
+      downloadState.filter = 'all';
+    }
+  });
+
+  $effect(() => {
+    if (downloadState.filter === 'failed' && downloadState.failedDownloadsCount === 0) {
       downloadState.filter = 'all';
     }
   });
@@ -601,6 +645,20 @@
       >
         <IconCheckboxChecked class="w-5 h-5" />
       </Button>
+      {#if source === 'sticky' && downloadState.filter === 'failed'}
+        <Button variant="ghost" class="btn-icon" disabled={bulkBusy} onclick={retryAllFailed} title={i18n.t('downloads.retry_failed')} aria-label={i18n.t('downloads.retry_failed')}>
+          <IconRetry class="w-5 h-5" />
+        </Button>
+      {:else if source === 'sticky' && (anyRunning || anyPaused)}
+        {@const label = anyRunning ? i18n.t('downloads.pause_all') : i18n.t('downloads.resume_all')}
+        <Button variant="ghost" class="btn-icon" disabled={bulkBusy} onclick={toggleAllDownloads} title={label} aria-label={label}>
+          {#if anyRunning}
+            <IconPause class="w-5 h-5" />
+          {:else}
+            <IconPlay class="w-5 h-5" />
+          {/if}
+        </Button>
+      {/if}
       <Button variant="ghost" class="btn-icon" onclick={openDownloadsFolder} title={i18n.t('downloads.open_folder')} aria-label={i18n.t('downloads.open_folder')}>
         <IconFolderOpen class="w-5 h-5" />
       </Button>
@@ -646,6 +704,9 @@
     {#if scaleVisible}<div class="scale-indicator">{configState.settings.grid_scale}%</div>{/if}
     <div class="grid-stack">
       <div class="downloads-grid" onwheel={handleGridWheel} style={`--grid-scale: ${scale}; --grid-card-width: ${Math.round(targetCardWidth)}px; --grid-gap: ${gap}px;`}>
+        {#if showQueueTile}
+          <DownloadQueueTile onshowfailed={() => (downloadState.filter = 'failed')} />
+        {/if}
         {#if groupByPosts}
           {#each groupedDownloads as group (group.key)}
             {@const media = previewItem(group.items)}
@@ -818,6 +879,46 @@
           <span class="text-sm font-semibold text-primary">{isSelectionActive ? (i18n.t('selection.exit')) : (i18n.t('selection.select_mode'))}</span>
         </div>
       </button>
+
+      {#if anyRunning || anyPaused}
+        <button
+          type="button"
+          class="sheet-action-item"
+          disabled={bulkBusy}
+          use:ripple
+          onclick={() => {
+            mobileMoreOpen = false;
+            void toggleAllDownloads();
+          }}
+        >
+          {#if anyRunning}
+            <IconPause class="text-secondary" />
+          {:else}
+            <IconPlay class="text-secondary" />
+          {/if}
+          <div class="flex flex-col min-w-0">
+            <span class="text-sm font-semibold text-primary">{anyRunning ? i18n.t('downloads.pause_all') : i18n.t('downloads.resume_all')}</span>
+          </div>
+        </button>
+      {/if}
+
+      {#if downloadState.failedDownloadsCount > 0}
+        <button
+          type="button"
+          class="sheet-action-item"
+          disabled={bulkBusy}
+          use:ripple
+          onclick={() => {
+            mobileMoreOpen = false;
+            void retryAllFailed();
+          }}
+        >
+          <IconRetry class="text-secondary" />
+          <div class="flex flex-col min-w-0">
+            <span class="text-sm font-semibold text-primary">{i18n.t('downloads.retry_failed')}</span>
+          </div>
+        </button>
+      {/if}
 
       <button
         type="button"

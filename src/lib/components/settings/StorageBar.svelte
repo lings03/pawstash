@@ -45,10 +45,16 @@
         color: p.quadrants[2]
       },
       {
+        id: 'metadata',
+        label: i18n.t('settings.cache_metadata'),
+        bytes: stats.metadata_bytes,
+        color: 'var(--text-muted)'
+      },
+      {
         id: 'other',
         label: i18n.t('settings.cache_other'),
         bytes: stats.other_bytes,
-        color: 'var(--text-muted)'
+        color: p.quadrants[0]
       }
     ];
 
@@ -107,13 +113,6 @@
         <span class="font-mono text-ink/90">{formatBytes(cat.bytes)}</span>
       </div>
     {/each}
-    {#if stats?.metadata_bytes && stats.metadata_bytes > 0}
-      <div class="flex items-center gap-1.5 text-[11.5px] text-ink/50">
-        <span class="w-2 h-2 rounded-full shrink-0 border border-veil/20 bg-veil/10"></span>
-        <span class="text-ink/40">{i18n.t('settings.cache_metadata')}:</span>
-        <span class="font-mono text-ink/70">{formatBytes(stats.metadata_bytes)}</span>
-      </div>
-    {/if}
   </div>
 </div>
 

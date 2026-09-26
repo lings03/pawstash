@@ -84,3 +84,34 @@ pub async fn set_window_effect(
 
     Ok(())
 }
+
+/// Applied live only on opaque Linux windows; elsewhere it would paint over the window effect.
+#[tauri::command]
+pub async fn set_window_background_color(
+    app: AppHandle,
+    color: String,
+    state: tauri::State<'_, crate::commands::AppState>,
+) -> Result<(), String> {
+    let parsed = crate::config::settings::parse_window_background_color(&color)
+        .ok_or_else(|| format!("{color} is not a valid window background colour"))?;
+
+    let settings = state.config_manager.load()?;
+    if settings.window_background_color != color {
+        state.config_manager.save_window_background_color(&color)?;
+    }
+
+    #[cfg(target_os = "linux")]
+    if !settings.linux_transparent_window {
+        use tauri::Manager;
+        if let Some(window) = app.get_webview_window("main") {
+            window
+                .set_background_color(Some(parsed))
+                .map_err(|error| error.to_string())?;
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = (app, parsed);
+
+    Ok(())
+}

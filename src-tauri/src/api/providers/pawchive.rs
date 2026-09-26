@@ -54,7 +54,7 @@ impl PawchiveClient {
             return Err("Pawchive login requires HTTPS".to_string());
         }
         let login_client = crate::net::builder_with_proxy(&settings)?
-            .timeout(Duration::from_secs(30))
+            .timeout(crate::net::defaults().request_timeout)
             .redirect(reqwest::redirect::Policy::none())
             .gzip(true)
             .build()
@@ -158,8 +158,13 @@ impl PawchiveClient {
             attempt.follow()
         });
 
+        let timeout = if settings.network_timeout_secs > 0 {
+            Duration::from_secs(settings.network_timeout_secs)
+        } else {
+            crate::net::defaults().request_timeout
+        };
         crate::net::builder_with_proxy(settings)?
-            .timeout(Duration::from_secs(45))
+            .timeout(timeout)
             .redirect(redirect_policy)
             .gzip(true)
             .build()
@@ -180,10 +185,16 @@ impl PawchiveClient {
     }
 
     fn build_headers(settings: &AppSettings) -> HeaderMap {
+        let user_agent = if settings.network_api_user_agent.trim().is_empty() {
+            crate::net::api_user_agent()
+        } else {
+            settings.network_api_user_agent.trim().to_string()
+        };
         let mut headers = HeaderMap::new();
         headers.insert(
             USER_AGENT,
-            HeaderValue::from_static(crate::downloader::PAWSTASH_USER_AGENT),
+            HeaderValue::from_str(&user_agent)
+                .unwrap_or_else(|_| HeaderValue::from_static(crate::net::DEFAULT_API_USER_AGENT)),
         );
         headers.insert(
             ACCEPT,
@@ -617,11 +628,7 @@ impl PawchiveClient {
             let u = url.clone();
             let response = self
                 .queue
-                .send_request(move || {
-                    client_clone
-                        .get(u.clone())
-                        .header(USER_AGENT, "Pawstash/0.1 link resolver")
-                })
+                .send_request(move || client_clone.get(u.clone()))
                 .await
                 .map_err(|error| error.to_string())?;
             if !response.status().is_redirection() {
@@ -1273,11 +1280,18 @@ impl PawchiveProvider {
             services: Self::default_services(),
             is_custom: false,
             priority: 1,
+            advanced_network: false,
+            user_agent: String::new(),
+            timeout_secs: 0,
+            proxy_url: String::new(),
+            max_retries: 0,
+            min_interval_ms: 0,
         }
     }
 
     pub fn new(config: ProviderConfig) -> Result<Self, String> {
-        Self::with_queue_config(config, Self::default_queue_config())
+        let queue_config = config.apply_queue_overrides(Self::default_queue_config());
+        Self::with_queue_config(config, queue_config)
     }
 
     pub fn with_queue_config(
@@ -1291,13 +1305,15 @@ impl PawchiveProvider {
             config.name.clone()
         };
 
-        let app_settings = AppSettings {
+        let mut app_settings = AppSettings {
             api_domain: config.api_url.clone(),
             file_domain: config.file_url.clone().unwrap_or_default(),
             image_domain: config.image_url.clone().unwrap_or_default(),
             session_cookie: config.session_cookie.clone(),
+            network_api_user_agent: config.effective_user_agent(),
             ..AppSettings::default()
         };
+        config.apply_network_to(&mut app_settings);
 
         let client = Arc::new(PawchiveClient::with_queue_config(
             app_settings,
@@ -2053,6 +2069,7 @@ mod tests {
             services: vec![],
             is_custom: false,
             priority: 1,
+            ..Default::default()
         };
         let provider = PawchiveProvider::new(conf).unwrap();
         assert_eq!(
@@ -2109,6 +2126,7 @@ mod tests {
             services: vec![],
             is_custom: false,
             priority: 1,
+            ..Default::default()
         };
         let fallback_provider = PawchiveProvider::new(fallback_conf).unwrap();
         assert_eq!(
@@ -2167,6 +2185,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits live provider APIs; run with `cargo test -- --ignored`"]
     async fn live_pawchive_public_contracts() {
         let conf = ProviderConfig {
             id: "pawchive".into(),
@@ -2183,6 +2202,7 @@ mod tests {
             services: vec!["patreon".into(), "fanbox".into()],
             is_custom: false,
             priority: 1,
+            ..Default::default()
         };
         let provider = PawchiveProvider::new(conf).unwrap();
 
@@ -2303,6 +2323,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits live provider APIs; run with `cargo test -- --ignored`"]
     async fn live_pawchive_popular_contracts() {
         let client = PawchiveClient::new(AppSettings::default()).unwrap();
         for period in ["day", "week", "month"] {
@@ -2332,6 +2353,7 @@ mod tests {
             services: vec!["patreon".into(), "fanbox".into()],
             is_custom: false,
             priority: 1,
+            ..Default::default()
         };
         let provider = PawchiveProvider::new(conf).unwrap();
         let schema = provider.auth_schema();

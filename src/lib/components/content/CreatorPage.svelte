@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy, tick, untrack } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import { contentState, creatorCacheKey, type CachedCreator } from '$lib/state/contentState.svelte';
   import { creatorsState } from '$lib/state/creatorsState.svelte';
   import { navigationState } from '$lib/state/navigationState.svelte';
@@ -37,6 +37,7 @@
     getPostDownloadTargets,
     getPostFormats
   } from '$lib/utils/media';
+  import { extraField } from '$lib/utils/fields';
   import { seedFromImageUrl, seedFromThumbHash } from '$lib/theme/seedColor';
   import { parseTags, getPostTags, formatDate, formatBytes, parseDateTimestamp, cleanPostTitle } from '$lib/utils/formatters';
   import { logger } from '$lib/utils/logger';
@@ -92,7 +93,6 @@
   import IconCheck from '~icons/fluent/checkmark-24-regular';
   import IconMoreVertical from '~icons/fluent/more-vertical-24-regular';
   import IconOpen from '~icons/fluent/open-24-regular';
-  import IconLink from '~icons/fluent/link-24-regular';
   import IconNews from '~icons/fluent/news-24-regular';
   import IconCard from '~icons/fluent/payment-24-regular';
   import IconClock from '~icons/fluent/clock-24-regular';
@@ -302,11 +302,13 @@
   let avatarUrl = $derived(creatorAvatarSrc(profile));
   let bannerUrl = $derived(creatorBannerSrc(profile));
   let candidateAvatarUrls = $derived.by<string[]>(() => {
-    const extraCandidate = profile?.extra?.candidate_avatar_urls;
-    const fromExtra = Array.isArray(extraCandidate) ? (extraCandidate as string[]) : [];
-    const main = avatarUrl;
-    if (!main) return fromExtra;
-    return [main, ...fromExtra.filter((u) => u !== main)];
+    const extraCandidate = extraField(profile, 'candidate_avatar_urls');
+    const candidates = [
+      avatarUrl,
+      ...(Array.isArray(extraCandidate) ? (extraCandidate as string[]) : []),
+      profile !== canonicalProfile ? creatorAvatarSrc(canonicalProfile) : ''
+    ];
+    return [...new Set(candidates.filter(Boolean))];
   });
   let effectiveAvatar = $derived(candidateAvatarUrls[avatarErrorIndex] ?? null);
   let effectiveBanner = $derived(bannerFailed ? null : bannerUrl);
@@ -328,18 +330,8 @@
 
   let initialLetter = $derived(creatorName ? creatorName.charAt(0).toUpperCase() : '?');
 
-  let rawUpdated = $derived(
-    profile?.updated ||
-    (profile?.extra as any)?.updated_at ||
-    (profile?.extra as any)?.updated ||
-    null
-  );
-  let rawIndexed = $derived(
-    profile?.indexed ||
-    (profile?.extra as any)?.indexed_at ||
-    (profile?.extra as any)?.indexed ||
-    null
-  );
+  let rawUpdated = $derived(profile?.updated || extraField<string | number>(profile, 'updated_at') || null);
+  let rawIndexed = $derived(profile?.indexed || extraField<string | number>(profile, 'indexed_at') || null);
   let latestPost = $derived(entry.posts.length > 0 ? entry.posts[0] : null);
   let rawLatestPostDate = $derived(latestPost?.published || latestPost?.added || null);
 
@@ -372,7 +364,7 @@
     }
 
     if (entry.posts.length === 0) {
-      const direct = parseTags(profile?.tags || (profile?.extra as any)?.tags || (profile?.extra as any)?.categories);
+      const direct = parseTags(extraField(profile, 'tags') || extraField(profile, 'categories'));
       for (const t of [...direct, ...apiCreatorTags]) {
         const clean = t.replace(/^#+/, '').trim();
         if (!clean) continue;
@@ -394,6 +386,16 @@
       .filter((item) => (entry.posts.length > 0 ? item.count > 0 : true))
       .sort((a, b) => b.count - a.count);
   });
+
+  const POPULARITY_FIELDS = ['favorite_count', 'favorites', 'favs', 'likes', 'likeCount', 'like_count', 'bookmarked', 'bookmarks', 'fav_count', 'score'];
+
+  function popularity(post: Post): number {
+    for (const key of POPULARITY_FIELDS) {
+      const value = extraField(post, key);
+      if (value !== undefined) return Number(value) || 0;
+    }
+    return 0;
+  }
 
   let normalizedPostSearch = $derived(postSearchQuery.trim().toLocaleLowerCase());
   let visibleCreatorPosts = $derived.by(() => {
@@ -449,10 +451,10 @@
 
     if (Object.keys(providerFilters).length > 0) {
       posts = posts.filter((post) => {
-        const raw = (post.extra as any)?.available_providers;
+        const raw = extraField(post, 'available_providers');
         const postProviders: string[] = Array.isArray(raw) && raw.length > 0
           ? (raw as string[])
-          : [(post as any).provider_id || (post.extra as any)?.provider_id || providerState.getProviderIdForService(post.service)];
+          : [extraField<string>(post, 'provider_id') || providerState.getProviderIdForService(post.service)];
         return matchesTriStateFilter(postProviders, providerFilters);
       });
     }
@@ -471,21 +473,7 @@
       });
     } else if (sortOrder === 'popular') {
       posts = [...posts].sort((a, b) => {
-        const getFav = (p: any) => Number(
-          p.favorite_count ??
-          p.extra?.favorite_count ??
-          p.extra?.favorites ??
-          p.extra?.favs ??
-          p.extra?.likes ??
-          p.extra?.likeCount ??
-          p.extra?.like_count ??
-          p.extra?.bookmarked ??
-          p.extra?.bookmarks ??
-          p.extra?.fav_count ??
-          p.extra?.score ??
-          0
-        );
-        const diff = getFav(b) - getFav(a);
+        const diff = popularity(b) - popularity(a);
         if (diff !== 0) return diff;
         const da = parseDateTimestamp(a.published || a.added);
         const db = parseDateTimestamp(b.published || b.added);
@@ -496,9 +484,7 @@
     return posts;
   });
 
-  let hasPopularityData = $derived(
-    entry.posts.some((p: any) => (p.favorite_count ?? p.extra?.favorite_count ?? p.extra?.bookmarked ?? 0) > 0)
-  );
+  let hasPopularityData = $derived(entry.posts.some((p) => popularity(p) > 0));
 
   let sortOptions = $derived.by(() => {
     const opts = [
@@ -982,7 +968,7 @@
       return;
     }
     if (!entry.loadingMore && entry.hasMore) {
-      await contentState.loadMoreCreatorPosts(service, creatorId);
+      await contentState.loadMoreCreatorPosts(service, creatorId, activeProviderId);
     }
   }
 
@@ -1018,10 +1004,6 @@
   function openInBrowser() {
     openInProvider();
   }
-
-  onDestroy(() => {
-    contentState.stopAutoFetchCreatorPosts(service, creatorId);
-  });
 
   let copiedId = $state(false);
   async function copyCreatorId() {

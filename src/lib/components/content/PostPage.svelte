@@ -29,6 +29,8 @@
   import { logger, logMediaError } from '$lib/utils/logger';
   import { convertFileSrc } from '@tauri-apps/api/core';
   import { getVideoThumbnail } from '$lib/utils/mediaThumbnail';
+  import { thumbnailKey } from '$lib/utils/cacheKey';
+  import { extraField } from '$lib/utils/fields';
   import { handleGlobalPanicKey, panicCapture } from '$lib/utils/panic';
   import PageShell from '$lib/components/layout/PageShell.svelte';
   import StickyHeader from '$lib/components/layout/StickyHeader.svelte';
@@ -155,7 +157,7 @@
   });
   let rawPost = $derived(entry.post);
   let availableProviders = $derived.by<string[]>(() => {
-    const raw = (rawPost as any)?.extra?.available_providers;
+    const raw = extraField(rawPost, 'available_providers');
     if (Array.isArray(raw)) return raw as string[];
     return [];
   });
@@ -527,7 +529,7 @@
 
   async function handleOpenCloudFromText(url: string) {
     let existing = cloudFolderResults.get(url) || globalCloudFolderCache.get(url);
-    if (!existing) {
+    if (!existing && configState.settings.cloud_scraping_enabled !== false) {
       try {
         existing = await apiResolveCloudLink(url);
         cloudFolderResults.set(url, existing);
@@ -547,7 +549,7 @@
   let lastResolvedKey = '';
   $effect(() => {
     const currentPostKey = postKey;
-    const cloudUrls = post?.cloud_urls || [];
+    const cloudUrls = configState.settings.cloud_scraping_enabled === false ? [] : post?.cloud_urls || [];
     const resolveKey = `${currentPostKey}:${cloudUrls.join('|')}`;
 
     untrack(() => {
@@ -1172,6 +1174,7 @@
     const kind = isEmbed ? 'video' : mediaViewerKind(file, url);
     return {
       id: key,
+      thumbnailKey: thumbnailKey(key, post),
       url,
       poster: cachedVideoThumb || attachmentThumbnailUrl(file, service, post),
       name: file.name || i18n.t('post.file'),
@@ -1456,7 +1459,7 @@
 
       const localJob = attachmentDownload(file);
       if (url) {
-        const key = localJob?.media_id || localJob?.id || localJob?.filename || file.path || file.name || `vid_${i}`;
+        const key = thumbnailKey(localJob?.media_id || localJob?.id || localJob?.filename || file.path || file.name || `vid_${i}`, post);
         getVideoThumbnail(key, url).then((thumb) => {
           if (thumb) {
             videoThumbnails = { ...videoThumbnails, [i]: thumb };
@@ -1486,11 +1489,8 @@
 
   let limitWarningText = $derived.by(() => {
     if (deferredAttachments.length === 0) {
-      const explicitWarning = typeof post?.warning === 'string'
-        ? post.warning
-        : typeof (post as any)?.extra?.warning === 'string'
-          ? (post as any).extra.warning
-          : '';
+      const warning = extraField(post, 'warning');
+      const explicitWarning = typeof warning === 'string' ? warning : '';
       if (explicitWarning) return explicitWarning;
       if (
         post?.detail_fetched &&

@@ -3,8 +3,19 @@ import { playbackState } from '$lib/state/playbackState.svelte';
 import { serverPortState } from '$lib/state/serverPort.svelte';
 import { logger } from '$lib/utils/logger';
 
+import { thumbnailKey } from '$lib/utils/cacheKey';
+
 const thumbnailMemoryCache = new Map<string, string>();
 const pendingRequests = new Map<string, Promise<string | undefined>>();
+const MAX_THUMBNAIL_CACHE_SIZE = 300;
+
+function setThumbnailCache(key: string, value: string) {
+  if (thumbnailMemoryCache.size >= MAX_THUMBNAIL_CACHE_SIZE) {
+    const firstKey = thumbnailMemoryCache.keys().next().value;
+    if (firstKey) thumbnailMemoryCache.delete(firstKey);
+  }
+  thumbnailMemoryCache.set(key, value);
+}
 
 export type MediaThumbnailKind = 'image' | 'video' | 'auto';
 
@@ -86,7 +97,7 @@ async function runExtraction(item: QueueItem) {
       logger.warn('Failed to persist thumbnail to backend', { key: item.key, error: err });
     }
 
-    thumbnailMemoryCache.set(item.key, resolved);
+    setThumbnailCache(item.key, resolved);
     item.resolve(resolved);
   } catch (err) {
     logger.warn('Thumbnail extraction exception', { key: item.key, error: err });
@@ -169,6 +180,36 @@ function extractImageThumbnail(imageUrl: string, maxWidth = 360): Promise<string
   });
 }
 
+export function isFrameBlankOrBlack(ctx: CanvasRenderingContext2D, width: number, height: number): boolean {
+  try {
+    const imgData = ctx.getImageData(0, 0, width, height);
+    const data = imgData.data;
+    if (!data || data.length < 16) return true;
+
+    const sampleCount = Math.min(500, Math.floor(data.length / 4));
+    const step = Math.max(1, Math.floor(data.length / (4 * sampleCount))) * 4;
+
+    let nonBlackCount = 0;
+    const requiredNonBlack = Math.max(10, Math.floor(sampleCount * 0.05));
+
+    for (let i = 0; i < data.length; i += step) {
+      const a = data[i + 3];
+      const r = data[i];
+      const g = data[i + 1];
+      const b = data[i + 2];
+      if (a > 30 && (r > 20 || g > 20 || b > 20)) {
+        nonBlackCount++;
+        if (nonBlackCount >= requiredNonBlack) {
+          return false;
+        }
+      }
+    }
+    return true;
+  } catch {
+    return true;
+  }
+}
+
 function extractVideoThumbnail(videoUrl: string, key?: string, maxWidth = 360): Promise<string | undefined> {
   return new Promise((resolve) => {
     const video = document.createElement('video');
@@ -177,22 +218,39 @@ function extractVideoThumbnail(videoUrl: string, key?: string, maxWidth = 360): 
     video.preload = 'metadata';
     video.crossOrigin = 'anonymous';
 
+    const offscreen = document.createElement('div');
+    offscreen.style.cssText =
+      'position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;opacity:0.001;pointer-events:none;overflow:hidden;';
+    offscreen.appendChild(video);
+    document.body.appendChild(offscreen);
+
     let isResolved = false;
+    let attempt = 0;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let captureTimer: ReturnType<typeof setTimeout> | undefined;
+
     const cleanup = () => {
+      if (timeout) clearTimeout(timeout);
+      if (captureTimer) clearTimeout(captureTimer);
+      video.onloadedmetadata = null;
+      video.onseeked = null;
+      video.onerror = null;
+      video.pause();
       video.removeAttribute('src');
       video.load();
-      video.remove();
+      if (offscreen.parentNode) {
+        offscreen.remove();
+      }
     };
 
     const done = (result?: string) => {
       if (isResolved) return;
       isResolved = true;
-      clearTimeout(timeout);
       cleanup();
       resolve(result);
     };
 
-    const timeout = setTimeout(() => {
+    timeout = setTimeout(() => {
       done(undefined);
     }, 6000);
 
@@ -205,7 +263,7 @@ function extractVideoThumbnail(videoUrl: string, key?: string, maxWidth = 360): 
         }
 
         const targetWidth = Math.min(maxWidth, vw);
-        const targetHeight = Math.max(120, Math.round(targetWidth * (vh / vw)));
+        const targetHeight = Math.max(80, Math.round(targetWidth * (vh / vw)));
         const canvas = document.createElement('canvas');
         canvas.width = targetWidth;
         canvas.height = targetHeight;
@@ -215,6 +273,21 @@ function extractVideoThumbnail(videoUrl: string, key?: string, maxWidth = 360): 
         }
 
         ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
+
+        if (isFrameBlankOrBlack(ctx, targetWidth, targetHeight)) {
+          attempt++;
+          const dur = video.duration && isFinite(video.duration) && video.duration > 0 ? video.duration : 10;
+          if (attempt === 1) {
+            video.currentTime = Math.min(dur * 0.9, Math.max(2.5, dur * 0.2));
+            return false;
+          } else if (attempt === 2) {
+            video.currentTime = Math.min(dur * 0.9, Math.max(4.5, dur * 0.4));
+            return false;
+          }
+          done(undefined);
+          return false;
+        }
+
         let dataUrl = canvas.toDataURL('image/webp', 0.82);
         if (!dataUrl || dataUrl.length < 50) {
           dataUrl = canvas.toDataURL('image/jpeg', 0.82);
@@ -230,28 +303,17 @@ function extractVideoThumbnail(videoUrl: string, key?: string, maxWidth = 360): 
     };
 
     video.onloadedmetadata = () => {
-      if (key && video.duration && isFinite(video.duration) && video.duration > 0) {
-        playbackState.saveDuration(key, video.duration);
+      const dur = video.duration && isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
+      if (key && dur > 0) {
+        playbackState.saveDuration(key, dur);
       }
-      const seekTime = video.duration > 1 ? 0.5 : Math.max(0.1, (video.duration || 1) / 2);
-      video.currentTime = seekTime;
+      const initialSeek = dur > 3 ? 1.5 : (dur > 1 ? 0.8 : Math.max(0.1, dur / 2));
+      video.currentTime = initialSeek;
     };
 
     video.onseeked = () => {
-      if (!tryCapture()) {
-        setTimeout(tryCapture, 100);
-      }
-    };
-
-    video.onloadeddata = () => {
-      if (!tryCapture()) {
-        const seekTime = video.duration > 1 ? 0.5 : Math.max(0.1, (video.duration || 1) / 2);
-        video.currentTime = seekTime;
-      }
-    };
-
-    video.oncanplay = () => {
-      tryCapture();
+      if (captureTimer) clearTimeout(captureTimer);
+      captureTimer = setTimeout(tryCapture, 60);
     };
 
     video.onerror = () => {
@@ -290,13 +352,13 @@ export async function getMediaThumbnail(
       const cachedPath = await invoke<string | null>('get_thumbnail_path', { key });
       const served = cachedPath ? mediaServerUrl(cachedPath) : undefined;
       if (served) {
-        thumbnailMemoryCache.set(key, served);
+        setThumbnailCache(key, served);
         return served;
       }
       if (cachedPath) {
         const cached = await invoke<string | null>('get_video_thumbnail', { key });
         if (cached) {
-          thumbnailMemoryCache.set(key, cached);
+          setThumbnailCache(key, cached);
           return cached;
         }
       }
@@ -339,7 +401,7 @@ export async function getPostThumbnail(
   targetUrl?: string
 ): Promise<string | undefined> {
   if (!post?.service || !post?.user || !post?.id) return undefined;
-  const key = `post:${post.service}:${post.user}:${post.id}`;
+  const key = thumbnailKey(undefined, post);
   const url = targetUrl || post.thumbnail_url || post.file?.thumbnail_url || post.file?.path;
   return getMediaThumbnail(key, url, 'auto', 360);
 }

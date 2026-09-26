@@ -19,6 +19,7 @@
   import IconVideo from '~icons/fluent/video-24-regular';
   import IconLoading from '~icons/svg-spinners/3-dots-fade';
   import { getMediaThumbnail } from '$lib/utils/mediaThumbnail';
+  import { thumbnailKey } from '$lib/utils/cacheKey';
 
   interface Props {
     items: DownloadItem[];
@@ -85,7 +86,16 @@
 
   function requestMediaThumbnail() {
     if ((!isVideo && !isImage) || generatedThumbnail || !previewUrl) return;
-    const key = representative?.media_id || representative?.id || representative?.filename;
+    const key = thumbnailKey(
+      representative?.media_id || representative?.id || representative?.filename,
+      representative
+        ? {
+            service: representative.service ?? '',
+            creator_id: representative.creator_id ?? '',
+            id: representative.post_id ?? ''
+          }
+        : null
+    );
     if (key) {
       getMediaThumbnail(key, previewUrl, isVideo ? 'video' : 'image').then((thumb) => {
         if (thumb) {

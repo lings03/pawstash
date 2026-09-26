@@ -15,6 +15,12 @@ export interface ProviderConfig {
   services: string[];
   is_custom: boolean;
   priority: number;
+  advanced_network?: boolean;
+  user_agent?: string;
+  timeout_secs?: number;
+  proxy_url?: string;
+  max_retries?: number;
+  min_interval_ms?: number;
 }
 
 export interface ProviderHealth {

@@ -74,7 +74,6 @@ pub fn extract_iframely_target_url(html: &str) -> Option<String> {
 pub async fn resolve_iframely(client: &Client, url_str: &str) -> Result<CloudFolderResult, String> {
     let resp = client
         .get(url_str)
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         .send()
         .await
         .map_err(|e| format!("Iframely request failed: {e}"))?;

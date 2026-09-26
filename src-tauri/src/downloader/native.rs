@@ -348,7 +348,8 @@ impl NativeDownloader {
         }
 
         let mut builder = crate::net::builder()
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36")
+            .read_timeout(crate::net::defaults().request_timeout)
+            .user_agent(crate::net::browser_user_agent())
             .redirect(reqwest::redirect::Policy::limited(10));
         match task.proxy_mode {
             ProxyMode::None => builder = builder.no_proxy(),

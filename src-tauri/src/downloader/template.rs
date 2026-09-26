@@ -321,6 +321,28 @@ pub fn resolve_filename(template: &str, ctx: &TemplateContext) -> String {
     }
 }
 
+pub fn resolve_target_dir(
+    root: &Path,
+    settings: &crate::config::settings::AppSettings,
+    ctx: &TemplateContext,
+) -> std::path::PathBuf {
+    let mut target_dir = root.to_path_buf();
+    if settings.download_group_by_creator {
+        let creator_folder =
+            resolve_creator_folder(&settings.download_creator_folder_template, ctx);
+        if !creator_folder.is_empty() {
+            target_dir = target_dir.join(creator_folder);
+        }
+    }
+    if settings.download_group_by_post {
+        let post_folder = resolve_post_folder(&settings.download_post_folder_template, ctx);
+        if !post_folder.is_empty() {
+            target_dir = target_dir.join(post_folder);
+        }
+    }
+    target_dir
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

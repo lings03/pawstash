@@ -23,6 +23,7 @@ use crate::subscriptions::SubscriptionManager;
 use crate::sync::client::SyncDevice;
 use crate::sync::manager::{SyncManager, SyncStatus};
 use std::collections::HashMap;
+
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -191,6 +192,7 @@ pub async fn probe_download_size(
     }
     let settings = state.config_manager.load()?;
     let session_cookie = settings.resolve_cookie_for_url(&url);
+    let proxy = crate::net::proxy_for_url(&settings, &url);
     let task = DownloadTask {
         id: "size-probe".to_string(),
         url,
@@ -199,11 +201,11 @@ pub async fn probe_download_size(
         final_path: String::new(),
         filename: String::new(),
         session_cookie,
-        proxy_mode: settings.proxy_mode,
-        proxy_url: settings.proxy_url,
-        proxy_username: settings.proxy_username,
-        proxy_password: settings.proxy_password,
-        proxy_bypass_local: settings.proxy_bypass_local,
+        proxy_mode: proxy.mode,
+        proxy_url: proxy.url,
+        proxy_username: proxy.username,
+        proxy_password: proxy.password,
+        proxy_bypass_local: proxy.bypass_local,
         connections: settings.aria2_connections.clamp(1, 32),
     };
     NativeDownloader::probe_total_size(&task)
@@ -223,21 +225,21 @@ pub async fn probe_download_sizes(
         return Ok(std::collections::HashMap::new());
     }
     let settings = state.config_manager.load()?;
+    let first_url = urls.first().cloned().unwrap_or_default();
+    let proxy = crate::net::proxy_for_url(&settings, &first_url);
     let task_template = DownloadTask {
         id: "size-probe-batch".to_string(),
-        url: urls.first().cloned().unwrap_or_default(),
+        session_cookie: settings.resolve_cookie_for_url(&first_url),
+        url: first_url,
         output_dir: String::new(),
         temp_path: String::new(),
         final_path: String::new(),
         filename: String::new(),
-        session_cookie: urls
-            .first()
-            .and_then(|u| settings.resolve_cookie_for_url(u)),
-        proxy_mode: settings.proxy_mode,
-        proxy_url: settings.proxy_url,
-        proxy_username: settings.proxy_username,
-        proxy_password: settings.proxy_password,
-        proxy_bypass_local: settings.proxy_bypass_local,
+        proxy_mode: proxy.mode,
+        proxy_url: proxy.url,
+        proxy_username: proxy.username,
+        proxy_password: proxy.password,
+        proxy_bypass_local: proxy.bypass_local,
         connections: settings.aria2_connections.clamp(1, 32),
     };
     Ok(NativeDownloader::probe_total_sizes_batch(&urls, &task_template).await)
@@ -259,54 +261,78 @@ pub fn get_default_settings() -> AppSettings {
     AppSettings::default()
 }
 
-#[tauri::command]
-pub fn get_cache_stats(state: State<'_, AppState>) -> Result<CacheStats, String> {
-    state.content.cache_stats()
+/// Synchronous commands run on the main thread; cache scans there freeze the window.
+async fn with_content<T: Send + 'static>(
+    state: &State<'_, AppState>,
+    work: impl FnOnce(&ContentRepository) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let content = state.content.clone();
+    tokio::task::spawn_blocking(move || work(&content))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn clear_content_cache(state: State<'_, AppState>) -> Result<CacheStats, String> {
-    state.content.clear_cached_images()
+pub fn set_app_hidden(hidden: bool) {
+    crate::db::compaction::set_app_hidden(hidden);
 }
 
 #[tauri::command]
-pub fn clear_all_content_cache(state: State<'_, AppState>) -> Result<CacheStats, String> {
-    state.content.clear_all_cache()
+pub async fn get_cache_stats(state: State<'_, AppState>) -> Result<CacheStats, String> {
+    with_content(&state, |content| content.cache_stats()).await
 }
 
 #[tauri::command]
-pub fn wipe_all_data(state: State<'_, AppState>) -> Result<CacheStats, String> {
+pub async fn clear_content_cache(state: State<'_, AppState>) -> Result<CacheStats, String> {
+    with_content(&state, |content| content.clear_cached_images()).await
+}
+
+#[tauri::command]
+pub async fn clear_all_content_cache(state: State<'_, AppState>) -> Result<CacheStats, String> {
+    with_content(&state, |content| content.clear_all_cache()).await
+}
+
+#[tauri::command]
+pub async fn wipe_all_data(state: State<'_, AppState>) -> Result<CacheStats, String> {
     state.download_manager.cancel_all();
-    state.content.wipe_all_data()
+    with_content(&state, |content| content.wipe_all_data()).await
 }
 
 #[tauri::command]
 pub async fn save_settings(
     mut settings: AppSettings,
     state: State<'_, AppState>,
+    app_handle: AppHandle,
 ) -> Result<(), String> {
     let previous = state.config_manager.load()?;
+    // Backend-owned: the frontend's copy is stale after any theme change.
+    settings.window_background_color = previous.window_background_color.clone();
     if settings.session_cookie.is_empty() {
         settings.session_cookie = previous.session_cookie.clone();
     }
     if settings.proxy_password.is_empty() {
         settings.proxy_password = previous.proxy_password.clone();
     }
-    for provider in &mut settings.providers {
-        if provider.session_cookie.is_empty() {
-            if let Some(previous_provider) = previous.providers.iter().find(|p| p.id == provider.id)
-            {
-                provider.session_cookie = previous_provider.session_cookie.clone();
-            }
-        }
-    }
+    // Owned by `save_providers` and login; the frontend's copy may predate the last edit.
+    settings.providers = previous.providers.clone();
     settings.normalize();
     ProviderManager::validate_configs(&settings.providers)?;
-    state
+    crate::net::validate_proxy_url(&settings.cloud_proxy_url)?;
+    if settings.proxy_mode == crate::config::settings::ProxyMode::Custom {
+        crate::net::validate_proxy_url(&settings.proxy_url)?;
+    }
+    // Publish first: the clients rebuilt below read from it.
+    crate::net::apply_settings(&settings);
+    if let Err(error) = state
         .pawchive_client
         .update_settings(settings.clone())
-        .await?;
+        .await
+    {
+        crate::net::apply_settings(&previous);
+        return Err(error);
+    }
     if let Err(error) = state.config_manager.save(&settings) {
+        crate::net::apply_settings(&previous);
         state.pawchive_client.update_settings(previous).await?;
         return Err(error);
     }
@@ -315,6 +341,7 @@ pub async fn save_settings(
         .update_providers(settings.providers.clone())
         .await
     {
+        crate::net::apply_settings(&previous);
         state.config_manager.save(&previous)?;
         state
             .pawchive_client
@@ -327,10 +354,91 @@ pub async fn save_settings(
         return Err(error);
     }
     state.content.set_cache_limit_mb(settings.cache_max_mb)?;
-    crate::net::reset_shared_clients();
     state.download_manager.notify_scheduler();
     let _ = state.sync_manager.set_enabled(settings.sync_enabled);
+    let _ = app_handle.emit(
+        "restart-pending",
+        crate::window_setup::pending_restart(&settings),
+    );
     Ok(())
+}
+
+#[tauri::command]
+pub fn restart_app(app_handle: AppHandle) -> Result<(), String> {
+    if !cfg!(desktop) {
+        return Err("Restarting is not supported on this platform".into());
+    }
+    app_handle.request_restart();
+    Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NetworkDefaultsInfo {
+    pub api_user_agent: String,
+    pub browser_user_agent: String,
+    pub request_timeout_secs: u64,
+    pub connect_timeout_secs: u64,
+    pub provider_deadline_secs: u64,
+    pub cloud_timeout_secs: u64,
+    pub cloud_max_redirects: u64,
+}
+
+#[tauri::command]
+pub fn get_network_defaults() -> NetworkDefaultsInfo {
+    NetworkDefaultsInfo {
+        api_user_agent: crate::net::DEFAULT_API_USER_AGENT.to_string(),
+        browser_user_agent: crate::net::DEFAULT_BROWSER_USER_AGENT.to_string(),
+        request_timeout_secs: crate::net::DEFAULT_REQUEST_TIMEOUT_SECS,
+        connect_timeout_secs: crate::net::DEFAULT_CONNECT_TIMEOUT_SECS,
+        provider_deadline_secs: crate::net::DEFAULT_PROVIDER_DEADLINE_SECS,
+        cloud_timeout_secs: crate::cloud::DEFAULT_CLOUD_TIMEOUT_SECS,
+        cloud_max_redirects: crate::cloud::DEFAULT_CLOUD_MAX_REDIRECTS,
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WebviewProxyStatus {
+    pub supported: bool,
+    pub active: bool,
+    pub needed: bool,
+}
+
+#[tauri::command]
+pub fn get_webview_proxy_status(state: State<'_, AppState>) -> Result<WebviewProxyStatus, String> {
+    let settings = state.config_manager.load()?;
+    Ok(WebviewProxyStatus {
+        supported: crate::webview_proxy::SUPPORTED,
+        active: crate::webview_proxy::is_active(),
+        needed: crate::webview_proxy::needed(&settings),
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProviderNetworkDefaults {
+    pub max_retries: u64,
+    pub min_interval_ms: u64,
+}
+
+#[tauri::command]
+pub async fn get_provider_network_defaults(
+    state: State<'_, AppState>,
+) -> Result<HashMap<String, ProviderNetworkDefaults>, String> {
+    Ok(state
+        .provider_manager
+        .get_provider_configs()
+        .await
+        .iter()
+        .map(|config| {
+            let queue = crate::api::providers::manager::default_queue_config_for(config);
+            (
+                config.id.clone(),
+                ProviderNetworkDefaults {
+                    max_retries: queue.max_retries as u64,
+                    min_interval_ms: queue.min_interval.as_millis() as u64,
+                },
+            )
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -346,6 +454,7 @@ pub async fn list_providers(state: State<'_, AppState>) -> Result<Vec<ProviderCo
 pub async fn save_providers(
     providers: Vec<ProviderConfig>,
     state: State<'_, AppState>,
+    app_handle: AppHandle,
 ) -> Result<(), String> {
     let previous = state.config_manager.load()?;
     let mut settings = previous.clone();
@@ -360,12 +469,21 @@ pub async fn save_providers(
     }
     settings.normalize();
     ProviderManager::validate_configs(&settings.providers)?;
-    state.config_manager.save(&settings)?;
+    crate::net::validate_proxy_url(&settings.cloud_proxy_url)?;
+    if settings.proxy_mode == crate::config::settings::ProxyMode::Custom {
+        crate::net::validate_proxy_url(&settings.proxy_url)?;
+    }
+    crate::net::apply_settings(&settings);
+    if let Err(error) = state.config_manager.save(&settings) {
+        crate::net::apply_settings(&previous);
+        return Err(error);
+    }
     if let Err(error) = state
         .provider_manager
         .update_providers(settings.providers.clone())
         .await
     {
+        crate::net::apply_settings(&previous);
         state.config_manager.save(&previous)?;
         state
             .provider_manager
@@ -373,6 +491,10 @@ pub async fn save_providers(
             .await?;
         return Err(error);
     }
+    let _ = app_handle.emit(
+        "restart-pending",
+        crate::window_setup::pending_restart(&settings),
+    );
     Ok(())
 }
 
@@ -566,6 +688,44 @@ fn persist_post_list(
     });
 }
 
+fn emit_partial_posts(
+    app_handle: &AppHandle,
+    stream_id: &Option<String>,
+    provider_id: &str,
+    posts: &[Post],
+) {
+    let Some(stream_id) = stream_id else { return };
+    if posts.is_empty() {
+        return;
+    }
+    let _ = app_handle.emit(
+        "posts-partial",
+        serde_json::json!({
+            "stream_id": stream_id,
+            "provider_id": provider_id,
+            "posts": posts,
+        }),
+    );
+}
+
+async fn emit_cached_posts(
+    app_handle: &AppHandle,
+    stream_id: &Option<String>,
+    content: Arc<ContentRepository>,
+    list_key: String,
+    offset: u32,
+) {
+    if stream_id.is_none() {
+        return;
+    }
+    let cached = tokio::task::spawn_blocking(move || content.load_post_list(&list_key, offset))
+        .await
+        .ok()
+        .and_then(|result| result.ok())
+        .unwrap_or_default();
+    emit_partial_posts(app_handle, stream_id, "cache", &cached);
+}
+
 async fn enrich_posts(
     posts: &mut [Post],
     manager: &crate::api::providers::manager::ProviderManager,
@@ -676,45 +836,27 @@ pub async fn fetch_creators(
 }
 
 #[tauri::command]
-pub async fn fetch_posts(
-    service: String,
-    user_id: String,
-    offset: u32,
-    state: State<'_, AppState>,
-) -> Result<Vec<Post>, String> {
-    let list_key = format!("creator:{service}:{user_id}:");
-    match state
-        .provider_manager
-        .fetch_posts(&service, &user_id, offset, None, None)
-        .await
-    {
-        Ok(mut posts) => {
-            enrich_posts(&mut posts, &state.provider_manager).await;
-            persist_post_list(state.content.clone(), list_key, offset, posts.clone());
-            Ok(posts)
-        }
-        Err(error) => {
-            let mut cached = state.content.load_post_list(&list_key, offset)?;
-            if cached.is_empty() {
-                Err(error)
-            } else {
-                enrich_posts(&mut cached, &state.provider_manager).await;
-                Ok(cached)
-            }
-        }
-    }
-}
-
-#[tauri::command]
 pub async fn fetch_recent_posts(
     query: Option<String>,
     offset: u32,
+    stream_id: Option<String>,
     state: State<'_, AppState>,
+    app_handle: AppHandle,
 ) -> Result<Vec<Post>, String> {
     let list_key = format!("recent:{}", query.as_deref().unwrap_or(""));
+    emit_cached_posts(
+        &app_handle,
+        &stream_id,
+        state.content.clone(),
+        list_key.clone(),
+        offset,
+    )
+    .await;
     match state
         .provider_manager
-        .fetch_recent_posts(query.as_deref(), offset)
+        .fetch_recent_posts_streaming(query.as_deref(), offset, |provider_id, posts| {
+            emit_partial_posts(&app_handle, &stream_id, provider_id, posts);
+        })
         .await
     {
         Ok(mut posts) => {
@@ -723,13 +865,23 @@ pub async fn fetch_recent_posts(
             Ok(posts)
         }
         Err(error) => {
-            let mut cached = state.content.load_post_list(&list_key, offset)?;
-            if cached.is_empty() && query.as_deref().unwrap_or("").is_empty() {
-                cached = state.content.list_recent_posts(offset, 50)?;
-            }
+            let content = state.content.clone();
+            let lk = list_key.clone();
+            let q_empty = query.as_deref().unwrap_or("").is_empty();
+            let cached = tokio::task::spawn_blocking(move || -> Result<Vec<Post>, String> {
+                let mut posts = content.load_post_list(&lk, offset)?;
+                if posts.is_empty() && q_empty {
+                    posts = content.list_recent_posts(offset, 50)?;
+                }
+                Ok(posts)
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+
             if cached.is_empty() {
                 Err(error)
             } else {
+                let mut cached = cached;
                 enrich_posts(&mut cached, &state.provider_manager).await;
                 Ok(cached)
             }
@@ -742,39 +894,44 @@ pub async fn fetch_popular_posts(
     period: String,
     date: Option<String>,
     offset: u32,
+    stream_id: Option<String>,
     state: State<'_, AppState>,
+    app_handle: AppHandle,
 ) -> Result<Vec<Post>, String> {
     let list_key = format!("popular:{period}:{}", date.as_deref().unwrap_or(""));
+    emit_cached_posts(
+        &app_handle,
+        &stream_id,
+        state.content.clone(),
+        list_key.clone(),
+        offset,
+    )
+    .await;
     match state
         .provider_manager
-        .fetch_popular_posts(&period, date.as_deref(), offset)
+        .fetch_popular_posts_streaming(&period, date.as_deref(), offset, |provider_id, posts| {
+            emit_partial_posts(&app_handle, &stream_id, provider_id, posts);
+        })
         .await
     {
         Ok(mut posts) => {
             enrich_posts(&mut posts, &state.provider_manager).await;
-            let content = state.content.clone();
-            let cache_key = list_key.clone();
-            let to_save = posts.clone();
-            let round_tripped = tokio::task::spawn_blocking(move || {
-                content.save_post_list(&cache_key, offset, &to_save)?;
-                content.load_post_list(&cache_key, offset)
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-
-            if let Ok(mut cached) = round_tripped {
-                if cached.len() == posts.len() {
-                    enrich_posts(&mut cached, &state.provider_manager).await;
-                    return Ok(cached);
-                }
-            }
+            persist_post_list(state.content.clone(), list_key, offset, posts.clone());
             Ok(posts)
         }
         Err(error) => {
-            let mut cached = state.content.load_post_list(&list_key, offset)?;
+            let content = state.content.clone();
+            let lk = list_key.clone();
+            let cached = tokio::task::spawn_blocking(move || -> Result<Vec<Post>, String> {
+                content.load_post_list(&lk, offset)
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+
             if cached.is_empty() {
                 Err(error)
             } else {
+                let mut cached = cached;
                 enrich_posts(&mut cached, &state.provider_manager).await;
                 Ok(cached)
             }
@@ -783,27 +940,74 @@ pub async fn fetch_popular_posts(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch_creator_posts(
     service: String,
     creator_id: String,
     query: Option<String>,
     offset: u32,
     provider_id: Option<String>,
+    force_refresh: Option<bool>,
+    stream_id: Option<String>,
     state: State<'_, AppState>,
+    app_handle: AppHandle,
 ) -> Result<Vec<Post>, String> {
     let prov_key = provider_id.as_deref().unwrap_or("auto");
     let list_key = format!(
         "creator:{service}:{creator_id}:{prov_key}:{}",
         query.as_deref().unwrap_or("")
     );
+    let force = force_refresh.unwrap_or(false);
+
+    if !force {
+        let content_for_cache = state.content.clone();
+        let list_key_for_cache = list_key.clone();
+        let cached_opt = tokio::task::spawn_blocking(move || {
+            let age_secs = content_for_cache
+                .get_post_list_age_secs(&list_key_for_cache, offset)
+                .ok()
+                .flatten();
+            if let Some(age) = age_secs {
+                if age < 900 {
+                    return content_for_cache
+                        .load_post_list(&list_key_for_cache, offset)
+                        .ok();
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten();
+
+        if let Some(mut cached) = cached_opt {
+            if !cached.is_empty() {
+                enrich_posts(&mut cached, &state.provider_manager).await;
+                return Ok(cached);
+            }
+        }
+    }
+
+    emit_cached_posts(
+        &app_handle,
+        &stream_id,
+        state.content.clone(),
+        list_key.clone(),
+        offset,
+    )
+    .await;
+
     let result = state
         .provider_manager
-        .fetch_posts(
+        .fetch_posts_streaming(
             &service,
             &creator_id,
             offset,
             query.as_deref(),
             provider_id.as_deref(),
+            |provider_id, posts| {
+                emit_partial_posts(&app_handle, &stream_id, provider_id, posts);
+            },
         )
         .await;
     match result {
@@ -813,16 +1017,27 @@ pub async fn fetch_creator_posts(
             Ok(posts)
         }
         Err(error) => {
-            let mut cached = state.content.load_post_list(&list_key, offset)?;
-            if cached.is_empty() && query.as_deref().unwrap_or("").is_empty() && prov_key == "auto"
-            {
-                cached = state
-                    .content
-                    .list_creator_posts(&service, &creator_id, offset, 50)?;
-            }
+            let content = state.content.clone();
+            let lk = list_key.clone();
+            let s = service.clone();
+            let c = creator_id.clone();
+            let q_empty = query.as_deref().unwrap_or("").is_empty();
+            let is_auto = prov_key == "auto";
+
+            let cached = tokio::task::spawn_blocking(move || -> Result<Vec<Post>, String> {
+                let mut posts = content.load_post_list(&lk, offset)?;
+                if posts.is_empty() && q_empty && is_auto {
+                    posts = content.list_creator_posts(&s, &c, offset, 50)?;
+                }
+                Ok(posts)
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+
             if cached.is_empty() {
                 Err(error)
             } else {
+                let mut cached = cached;
                 enrich_posts(&mut cached, &state.provider_manager).await;
                 Ok(cached)
             }
@@ -1069,46 +1284,66 @@ pub async fn fetch_post(
     creator_id: String,
     post_id: String,
     provider_id: Option<String>,
+    prefetch: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<Post, String> {
     let prov_key = provider_id.as_deref().unwrap_or("auto");
-    match state
-        .provider_manager
-        .fetch_post(&service, &creator_id, &post_id, provider_id.as_deref())
-        .await
-    {
+    let fetch =
+        state
+            .provider_manager
+            .fetch_post(&service, &creator_id, &post_id, provider_id.as_deref());
+    let result = if prefetch.unwrap_or(false) {
+        crate::api::providers::queue::in_background(fetch).await
+    } else {
+        fetch.await
+    };
+    match result {
         Ok(Some(mut reconciled)) => {
             enrich_posts(
                 std::slice::from_mut(&mut reconciled.post),
                 &state.provider_manager,
             )
             .await;
-            state
-                .content
-                .save_posts(std::slice::from_ref(&reconciled.post))?;
-            if !reconciled.revisions.is_empty() {
-                for rev in &mut reconciled.revisions {
-                    enrich_posts(std::slice::from_mut(&mut rev.post), &state.provider_manager)
-                        .await;
+            let content = state.content.clone();
+            let to_save = reconciled.post.clone();
+            let revisions = reconciled.revisions.clone();
+            let s = service.clone();
+            let c = creator_id.clone();
+            let p = post_id.clone();
+            let p_key = prov_key.to_string();
+            tokio::task::spawn_blocking(move || {
+                let _ = content.save_posts(std::slice::from_ref(&to_save));
+                for rev in &revisions {
                     let pid = rev
                         .post
                         .extra
                         .get("provider_id")
                         .and_then(|v| v.as_str())
-                        .unwrap_or(prov_key);
-                    let _ = state.content.save_post_revisions(
-                        &service,
-                        &creator_id,
-                        &post_id,
-                        pid,
-                        std::slice::from_ref(rev),
-                    );
+                        .unwrap_or(&p_key);
+                    let _ = content.save_post_revisions(&s, &c, &p, pid, std::slice::from_ref(rev));
+                }
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+
+            if !reconciled.revisions.is_empty() {
+                for rev in &mut reconciled.revisions {
+                    enrich_posts(std::slice::from_mut(&mut rev.post), &state.provider_manager)
+                        .await;
                 }
             }
             Ok(reconciled.post)
         }
         Ok(None) => {
-            if let Ok(Some(mut post)) = state.content.get_post(&service, &creator_id, &post_id) {
+            let content = state.content.clone();
+            let s = service.clone();
+            let c = creator_id.clone();
+            let p = post_id.clone();
+            let cached = tokio::task::spawn_blocking(move || content.get_post(&s, &c, &p))
+                .await
+                .map_err(|e| e.to_string())?;
+
+            if let Ok(Some(mut post)) = cached {
                 let matches_provider = match provider_id.as_deref() {
                     Some("auto") | None => true,
                     Some(pid) => post
@@ -1125,7 +1360,15 @@ pub async fn fetch_post(
             Err(format!("Post not found on provider '{prov_key}'"))
         }
         Err(error) => {
-            if let Ok(Some(mut post)) = state.content.get_post(&service, &creator_id, &post_id) {
+            let content = state.content.clone();
+            let s = service.clone();
+            let c = creator_id.clone();
+            let p = post_id.clone();
+            let cached = tokio::task::spawn_blocking(move || content.get_post(&s, &c, &p))
+                .await
+                .map_err(|e| e.to_string())?;
+
+            if let Ok(Some(mut post)) = cached {
                 let matches_provider = match provider_id.as_deref() {
                     Some("auto") | None => true,
                     Some(pid) => post
@@ -2507,30 +2750,17 @@ pub async fn start_download(
             index,
             media_id: &media_id,
         };
-        let mut target_dir = root;
-        if settings.download_group_by_creator {
-            let creator_folder = crate::downloader::template::resolve_creator_folder(
-                &settings.download_creator_folder_template,
-                &ctx,
-            );
-            if !creator_folder.is_empty() {
-                target_dir = target_dir.join(creator_folder);
-            }
-        }
-        if settings.download_group_by_post {
-            let post_folder = crate::downloader::template::resolve_post_folder(
-                &settings.download_post_folder_template,
-                &ctx,
-            );
-            if !post_folder.is_empty() {
-                target_dir = target_dir.join(post_folder);
-            }
-        }
+        let target_dir = crate::downloader::template::resolve_target_dir(&root, &settings, &ctx);
         std::fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
         let source_url = state
             .provider_manager
             .resolve_post_url(&post.service, &post.user, &post.id, None)
             .await;
+        let raw_json = state
+            .content
+            .get_post_raw_json(&post.service, &post.user, &post.id)
+            .ok()
+            .flatten();
         let meta = crate::downloader::metadata::PostMetadataExport {
             service: &post.service,
             creator_id: &post.user,
@@ -2542,6 +2772,7 @@ pub async fn start_download(
             tags: tags_vec.as_deref(),
             origin_url: post.origin.clone(),
             source_url: Some(source_url),
+            raw_json: raw_json.as_deref(),
         };
         crate::downloader::metadata::save_post_metadata(&target_dir, &meta, &settings)?;
     }
@@ -3692,8 +3923,11 @@ pub async fn resolve_cloud_link(
         }
     }
 
-    let settings = state.config_manager.load().ok();
-    let resolver = crate::cloud::CloudResolver::new(settings.as_ref());
+    let settings = state.config_manager.load()?;
+    if !settings.cloud_scraping_enabled {
+        return Err("Cloud link scraping is disabled in settings".to_string());
+    }
+    let resolver = crate::cloud::CloudResolver::new(&settings)?;
     match resolver.resolve(&url).await {
         Ok(result) => {
             let _ = state

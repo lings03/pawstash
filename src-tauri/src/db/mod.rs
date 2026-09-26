@@ -1,3 +1,4 @@
+pub mod compaction;
 pub mod content;
 pub mod downloads;
 pub mod library;

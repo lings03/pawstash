@@ -49,8 +49,6 @@ fn clean_onlyhaven_title(raw: &str) -> String {
     words.join(" ")
 }
 
-const DEFAULT_TIMEOUT_SECS: u64 = 30;
-
 #[derive(Debug, Clone, Deserialize, Default)]
 struct OnlyHavenListResponse<T> {
     #[serde(default)]
@@ -509,6 +507,7 @@ impl OnlyHavenPostRow {
 }
 
 pub struct OnlyHavenProvider {
+    id: String,
     config: Arc<RwLock<ProviderConfig>>,
     client: Client,
     current_mirror_idx: AtomicUsize,
@@ -610,11 +609,18 @@ impl OnlyHavenProvider {
             services: Self::default_services(),
             is_custom: false,
             priority: 3,
+            advanced_network: false,
+            user_agent: String::new(),
+            timeout_secs: 0,
+            proxy_url: String::new(),
+            max_retries: 0,
+            min_interval_ms: 0,
         }
     }
 
     pub fn new(config: ProviderConfig) -> Result<Self, String> {
-        Self::with_queue_config(config, Self::default_queue_config())
+        let queue_config = config.apply_queue_overrides(Self::default_queue_config());
+        Self::with_queue_config(config, queue_config)
     }
 
     pub fn with_queue_config(
@@ -624,19 +630,22 @@ impl OnlyHavenProvider {
         let mut headers = HeaderMap::new();
         headers.insert(
             USER_AGENT,
-            HeaderValue::from_static(crate::downloader::PAWSTASH_USER_AGENT),
+            HeaderValue::from_str(&config.effective_user_agent())
+                .unwrap_or_else(|_| HeaderValue::from_static(crate::net::DEFAULT_API_USER_AGENT)),
         );
 
-        let client = crate::net::builder()
-            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+        let client = config
+            .network_builder()
+            .timeout(config.effective_timeout())
             .gzip(true)
             .default_headers(headers)
             .build()
             .map_err(|e| format!("Failed to build HTTP client for OnlyHaven: {e}"))?;
 
-        let queue = Arc::new(ProviderRequestQueue::new("onlyhaven", queue_config));
+        let queue = Arc::new(ProviderRequestQueue::new(&config.id, queue_config));
 
         Ok(Self {
+            id: config.id.clone(),
             config: Arc::new(RwLock::new(config)),
             client,
             current_mirror_idx: AtomicUsize::new(0),
@@ -802,7 +811,7 @@ impl OnlyHavenProvider {
 #[async_trait]
 impl SourceProvider for OnlyHavenProvider {
     fn id(&self) -> &str {
-        "onlyhaven"
+        &self.id
     }
 
     fn name(&self) -> &str {
@@ -1469,15 +1478,7 @@ impl SourceProvider for OnlyHavenProvider {
         for url in candidate_urls {
             let client = self.client.clone();
             let u = url.clone();
-            if let Ok(resp) = self
-                .queue
-                .send_request(move || {
-                    client
-                        .get(&u)
-                        .header(USER_AGENT, crate::downloader::PAWSTASH_USER_AGENT)
-                })
-                .await
-            {
+            if let Ok(resp) = self.queue.send_request(move || client.get(&u)).await {
                 if resp.status().is_success() {
                     let content_type = resp
                         .headers()
@@ -1775,6 +1776,7 @@ mod tests {
             file_prefix: None,
             image_prefix: None,
             is_custom: false,
+            ..Default::default()
         })
         .unwrap();
 
@@ -1915,6 +1917,7 @@ mod tests {
             file_prefix: None,
             image_prefix: None,
             is_custom: false,
+            ..Default::default()
         }
     }
 
@@ -1930,6 +1933,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits live provider APIs; run with `cargo test -- --ignored`"]
     async fn live_onlyhaven_public_contracts() {
         let conf = ProviderConfig {
             id: "onlyhaven".into(),
@@ -1946,6 +1950,7 @@ mod tests {
             services: vec!["onlyfans".into(), "fansly".into()],
             is_custom: false,
             priority: 1,
+            ..Default::default()
         };
         let provider = OnlyHavenProvider::new(conf).expect("create OnlyHavenProvider");
 

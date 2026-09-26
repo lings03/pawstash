@@ -1,3 +1,5 @@
+import { extraField } from './fields';
+
 export function formatBytes(bytes: number, decimals: number = 2): string {
   if (bytes === 0) return '0 B';
   const k = 1024;
@@ -86,7 +88,7 @@ export function parseTags(tagsValue?: any): string[] {
 
 export function getPostTags(post?: any): string[] {
   if (!post) return [];
-  const direct = parseTags(post.tags ?? post.extra?.tags ?? post.extra?.categories);
+  const direct = parseTags(extraField(post, 'tags') || extraField(post, 'categories'));
   const tagSet = new Set<string>(direct);
 
   const extractHashtags = (text?: string | null) => {

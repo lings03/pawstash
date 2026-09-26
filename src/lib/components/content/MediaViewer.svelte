@@ -3,6 +3,7 @@
 
   export interface MediaViewerItem {
     id: string;
+    thumbnailKey?: string;
     url: string;
     name: string;
     kind: MediaViewerKind;
@@ -34,7 +35,7 @@
   import { logMediaError } from '$lib/utils/logger';
   import { diagnoseVideoFailure, diagnoseVideoFailureAsync, getUnsupportedContainerFormat, getFileExtension, type MediaFailureState } from '$lib/utils/media';
   import { apiOpenDownloadFile } from '$lib/utils/ipc';
-  import { getVideoThumbnail } from '$lib/utils/mediaThumbnail';
+  import { getVideoThumbnail, isFrameBlankOrBlack } from '$lib/utils/mediaThumbnail';
   import Button from '$lib/components/ui/Button.svelte';
   import IconDismiss from '~icons/fluent/dismiss-24-regular';
   import IconChevronLeft from '~icons/fluent/chevron-left-24-regular';
@@ -110,6 +111,7 @@
   let slideTimer: ReturnType<typeof setTimeout> | undefined;
   let dismissScale = $derived(1 - Math.min(0.25, Math.abs(dismissOffsetY) * 0.0005));
   let dismissOpacity = $derived(Math.max(0.1, 1 - Math.abs(dismissOffsetY) / 350));
+  let isGestureDragging = $derived(!isDismissing && (isSwiping || dismissOffsetY !== 0));
   let controlsVisible = $state(true);
   let fullscreen = $state(false);
   let root = $state<HTMLDivElement>();
@@ -139,9 +141,6 @@
       loadedWidth = video.videoWidth;
       loadedHeight = video.videoHeight;
       aspectRatios[index] = video.videoWidth / video.videoHeight;
-      if (!current?.poster && !videoThumbnails[index]) {
-        captureVideoFrame(video, index);
-      }
     }
     if (video.duration && isFinite(video.duration) && video.duration > 0) {
       activeVideoDuration = video.duration;
@@ -161,6 +160,9 @@
     const video = e.currentTarget as HTMLVideoElement;
     if (current && video.duration > 0) {
       playbackState.saveTime(current.id || current.url, video.currentTime, video.duration);
+    }
+    if (!current?.poster && !videoThumbnails[index] && video.currentTime >= 0.8) {
+      captureVideoFrame(video, index);
     }
   }
 
@@ -225,7 +227,7 @@
   function requestVideoThumbnail(itemIndex: number) {
     const it = items[itemIndex];
     if (!it || it.kind !== 'video' || videoThumbnails[itemIndex]) return;
-    const key = it.id || it.name || it.url;
+    const key = it.thumbnailKey || it.id || it.name || it.url;
     const videoUrl = it.url;
     if (!videoUrl) return;
     getVideoThumbnail(key, videoUrl).then((thumb) => {
@@ -248,20 +250,24 @@
 
   function captureVideoFrame(video: HTMLVideoElement, itemIndex: number) {
     try {
-      if (!video.videoWidth || !video.videoHeight) return;
+      if (!video.videoWidth || !video.videoHeight || video.currentTime < 0.5) return;
+      const targetWidth = Math.min(360, video.videoWidth);
+      const targetHeight = Math.max(80, Math.round(targetWidth * (video.videoHeight / video.videoWidth)));
       const canvas = document.createElement('canvas');
-      const w = 240;
-      const h = Math.max(80, Math.round(w * (video.videoHeight / video.videoWidth)));
-      canvas.width = w;
-      canvas.height = h;
+      canvas.width = targetWidth;
+      canvas.height = targetHeight;
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
-      ctx.drawImage(video, 0, 0, w, h);
-      const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
-      if (dataUrl && dataUrl.length > 100) {
+      ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
+      if (isFrameBlankOrBlack(ctx, targetWidth, targetHeight)) return;
+      let dataUrl = canvas.toDataURL('image/webp', 0.82);
+      if (!dataUrl || dataUrl.length < 50) {
+        dataUrl = canvas.toDataURL('image/jpeg', 0.82);
+      }
+      if (dataUrl && dataUrl.length > 50) {
         videoThumbnails = { ...videoThumbnails, [itemIndex]: dataUrl };
         const it = items[itemIndex];
-        const key = it?.id || it?.name || it?.url;
+        const key = it?.thumbnailKey || it?.id || it?.name || it?.url;
         if (key) {
           invoke('store_video_thumbnail', { key, dataUrl }).catch(() => {});
         }
@@ -273,7 +279,7 @@
     const vid = event.currentTarget as HTMLVideoElement;
     if (vid.videoWidth && vid.videoHeight) {
       aspectRatios[index] = vid.videoWidth / vid.videoHeight;
-      if (!current?.poster && !videoThumbnails[index]) {
+      if (!current?.poster && !videoThumbnails[index] && vid.currentTime >= 0.5) {
         captureVideoFrame(vid, index);
       }
     }
@@ -917,6 +923,7 @@
         bind:this={fitFrame}
         class="media-fit-frame"
         class:is-swiping={isSwiping}
+        class:is-dragging={isGestureDragging}
         class:is-sliding-out={slidePhase === 'out'}
         class:is-sliding-in={slidePhase === 'in'}
         class:file-frame={!['image', 'video'].includes(current.kind)}
@@ -1406,6 +1413,10 @@
 
   .media-fit-frame.is-swiping {
     transition: none !important;
+  }
+
+  .media-fit-frame.is-dragging .media-viewer-media {
+    transition: none;
   }
 
   .media-fit-frame.is-sliding-out {

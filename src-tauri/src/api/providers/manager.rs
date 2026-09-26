@@ -8,11 +8,201 @@ use super::traits::{
 };
 use crate::api::models::*;
 use crate::api::reconciliation::{reconcile_post_snapshots, ReconciledPost};
-use crate::db::storage::{content_cache_path, sanitize_cache_key};
-use futures_util::future::join_all;
+use crate::db::storage::{content_cache_path, sanitize_cache_key, thumbs_cache_path};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
+
+fn provider_deadline() -> Duration {
+    crate::net::provider_deadline()
+}
+
+fn provider_hard_limit() -> Duration {
+    let net = crate::net::defaults();
+    net.request_timeout
+        .max(net.max_provider_timeout)
+        .max(net.provider_deadline)
+        * 2
+}
+
+trait Payload {
+    fn has_data(&self) -> bool;
+}
+
+impl<T> Payload for Vec<T> {
+    fn has_data(&self) -> bool {
+        !self.is_empty()
+    }
+}
+
+impl<T> Payload for Option<T> {
+    fn has_data(&self) -> bool {
+        self.is_some()
+    }
+}
+
+impl Payload for Creator {
+    fn has_data(&self) -> bool {
+        true
+    }
+}
+
+impl Payload for bool {
+    fn has_data(&self) -> bool {
+        *self
+    }
+}
+
+struct FanOut<T> {
+    ok: Vec<(String, T)>,
+    errors: Vec<String>,
+    timed_out: Vec<String>,
+}
+
+impl<T: Payload> FanOut<T> {
+    fn any_success(&self) -> bool {
+        !self.ok.is_empty()
+    }
+
+    /// Empty only counts once every provider has answered.
+    fn is_conclusive(&self) -> bool {
+        self.ok.iter().any(|(_, value)| value.has_data())
+            || (self.any_success() && self.timed_out.is_empty())
+    }
+
+    fn into_errors(self) -> Vec<String> {
+        let mut errors = self.errors;
+        errors.extend(
+            self.timed_out
+                .into_iter()
+                .map(|id| format!("Provider '{id}' timed out")),
+        );
+        errors
+    }
+}
+
+/// Stragglers are dropped only once some provider has returned data.
+async fn run_fan_out<T, I, Fut, F>(
+    labelled: I,
+    soft_deadline: Option<Duration>,
+    mut on_provider: F,
+) -> FanOut<T>
+where
+    I: IntoIterator<Item = (String, Fut)>,
+    Fut: std::future::Future<Output = Result<T, String>>,
+    T: Payload,
+    F: FnMut(&str, &T),
+{
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
+    let hard_limit = provider_hard_limit();
+    let started = tokio::time::Instant::now();
+    let mut ids = Vec::new();
+    let mut pending: FuturesUnordered<_> = labelled
+        .into_iter()
+        .enumerate()
+        .map(|(index, (id, task))| {
+            ids.push(id);
+            async move { (index, tokio::time::timeout(hard_limit, task).await.ok()) }
+        })
+        .collect();
+
+    let mut finished = vec![false; ids.len()];
+    let mut ranked: Vec<(usize, T)> = Vec::new();
+    let mut errors = Vec::new();
+    let mut have_data = false;
+    loop {
+        let next = match soft_deadline {
+            Some(deadline) if have_data => {
+                match tokio::time::timeout_at(started + deadline, pending.next()).await {
+                    Ok(next) => next,
+                    Err(_) => break,
+                }
+            }
+            _ => pending.next().await,
+        };
+        let Some((index, result)) = next else { break };
+        let Some(result) = result else { continue };
+        finished[index] = true;
+        match result {
+            Ok(value) => {
+                have_data |= value.has_data();
+                on_provider(&ids[index], &value);
+                ranked.push((index, value));
+            }
+            Err(error) => errors.push(error),
+        }
+    }
+
+    let mut timed_out = Vec::new();
+    for (index, id) in ids.iter().enumerate() {
+        if !finished[index] {
+            tracing::warn!(provider = %id, "Provider too slow; continuing without it");
+            timed_out.push(id.clone());
+        }
+    }
+    ranked.sort_by_key(|(index, _)| *index);
+    FanOut {
+        ok: ranked
+            .into_iter()
+            .map(|(index, value)| (ids[index].clone(), value))
+            .collect(),
+        errors,
+        timed_out,
+    }
+}
+
+async fn fan_out<T, I, Fut>(labelled: I, soft_deadline: Duration) -> FanOut<T>
+where
+    I: IntoIterator<Item = (String, Fut)>,
+    Fut: std::future::Future<Output = Result<T, String>>,
+    T: Payload,
+{
+    run_fan_out(labelled, Some(soft_deadline), |_, _| {}).await
+}
+
+async fn fan_out_streaming<T, I, Fut, F>(labelled: I, on_provider: F) -> FanOut<T>
+where
+    I: IntoIterator<Item = (String, Fut)>,
+    Fut: std::future::Future<Output = Result<T, String>>,
+    T: Payload,
+    F: FnMut(&str, &T),
+{
+    run_fan_out(labelled, None, on_provider).await
+}
+
+fn dedupe_by<T, K: Eq + std::hash::Hash>(batches: Vec<Vec<T>>, key: impl Fn(&T) -> K) -> Vec<T> {
+    let mut seen = HashSet::new();
+    let mut merged = Vec::new();
+    for batch in batches {
+        for item in batch {
+            if seen.insert(key(&item)) {
+                merged.push(item);
+            }
+        }
+    }
+    merged
+}
+
+fn dedupe_posts(batches: Vec<Vec<Post>>) -> Vec<Post> {
+    dedupe_by(batches, |post| {
+        format!("{}:{}", post.service.to_lowercase(), post.id)
+    })
+}
+
+fn sort_by_published_desc(posts: &mut [Post]) {
+    posts.sort_by_key(|post| {
+        std::cmp::Reverse(
+            post.published
+                .as_deref()
+                .or(post.added.as_deref())
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0),
+        )
+    });
+}
 
 fn provider_errors(operation: &str, errors: Vec<String>) -> String {
     if errors.is_empty() {
@@ -35,6 +225,16 @@ fn create_provider(config: ProviderConfig) -> Result<Arc<dyn SourceProvider>, St
     }
 }
 
+pub fn default_queue_config_for(config: &ProviderConfig) -> ProviderQueueConfig {
+    if OnlyHavenProvider::matches_config(config) {
+        OnlyHavenProvider::default_queue_config()
+    } else if CoomerProvider::matches_config(config) {
+        CoomerProvider::default_queue_config()
+    } else {
+        PawchiveProvider::default_queue_config()
+    }
+}
+
 const ARTWORK_EXTENSIONS: [&str; 5] = ["webp", "png", "jpg", "jpeg", "gif"];
 
 const ARTWORK_INDEX_TTL: std::time::Duration = std::time::Duration::from_secs(15);
@@ -46,11 +246,25 @@ struct ArtworkIndex {
 }
 
 impl ArtworkIndex {
-    fn contains(&self, kind: &str, filename: &str) -> bool {
-        match kind {
-            "banner" => self.banners.contains(filename),
-            _ => self.avatars.contains(filename),
+    fn find_match(&self, kind: &str, stem: &str) -> Option<String> {
+        let set = if kind == "banner" {
+            &self.banners
+        } else {
+            &self.avatars
+        };
+        for ext in ARTWORK_EXTENSIONS {
+            let direct = format!("{stem}.{ext}");
+            if set.contains(&direct) {
+                return Some(direct);
+            }
         }
+        let prefix = stem.strip_suffix(&format!("_{kind}")).unwrap_or(stem);
+        for filename in set {
+            if filename.starts_with(prefix) && filename.contains(kind) {
+                return Some(filename.clone());
+            }
+        }
+        None
     }
 }
 
@@ -67,7 +281,7 @@ fn list_dir_filenames(dir: &std::path::Path) -> HashSet<String> {
 pub struct ProviderManager {
     providers: Arc<RwLock<Vec<Arc<dyn SourceProvider>>>>,
     default_queue: Arc<ProviderRequestQueue>,
-    artwork_index: Arc<RwLock<Option<ArtworkIndex>>>,
+    artwork_index: Arc<RwLock<Option<Arc<ArtworkIndex>>>>,
 }
 
 impl ProviderManager {
@@ -78,11 +292,8 @@ impl ProviderManager {
         } else {
             "avatars"
         });
-        for ext in ARTWORK_EXTENSIONS {
-            let filename = format!("{stem}.{ext}");
-            if index.contains(kind, &filename) {
-                return Some(dir.join(filename).to_string_lossy().into_owned());
-            }
+        if let Some(filename) = index.find_match(kind, stem) {
+            return Some(dir.join(filename).to_string_lossy().into_owned());
         }
         None
     }
@@ -90,11 +301,7 @@ impl ProviderManager {
     async fn artwork_index(&self) -> Arc<ArtworkIndex> {
         if let Some(index) = self.artwork_index.read().await.as_ref() {
             if index.loaded_at.elapsed() < ARTWORK_INDEX_TTL {
-                return Arc::new(ArtworkIndex {
-                    loaded_at: index.loaded_at,
-                    avatars: index.avatars.clone(),
-                    banners: index.banners.clone(),
-                });
+                return Arc::clone(index);
             }
         }
 
@@ -108,17 +315,12 @@ impl ProviderManager {
         .await
         .unwrap_or_default();
 
-        let index = ArtworkIndex {
+        let snapshot = Arc::new(ArtworkIndex {
             loaded_at: std::time::Instant::now(),
             avatars: listed.0,
             banners: listed.1,
-        };
-        let snapshot = Arc::new(ArtworkIndex {
-            loaded_at: index.loaded_at,
-            avatars: index.avatars.clone(),
-            banners: index.banners.clone(),
         });
-        *self.artwork_index.write().await = Some(index);
+        *self.artwork_index.write().await = Some(Arc::clone(&snapshot));
         snapshot
     }
 
@@ -163,6 +365,10 @@ impl ProviderManager {
 
     pub fn validate_configs(configs: &[ProviderConfig]) -> Result<(), String> {
         for config in configs {
+            if config.advanced_network {
+                crate::net::validate_proxy_url(&config.proxy_url)
+                    .map_err(|error| format!("{}: {error}", config.name))?;
+            }
             create_provider(config.clone())?;
         }
         Ok(())
@@ -307,90 +513,75 @@ impl ProviderManager {
             return Err("No enabled providers configured".to_string());
         }
 
-        let tasks: Vec<_> = enabled
-            .iter()
-            .map(|p| {
-                let p = p.clone();
-                async move { (p.id().to_string(), p.fetch_creators().await) }
-            })
-            .collect();
+        let tasks = enabled.iter().map(|p| {
+            let p = p.clone();
+            (p.id().to_string(), async move { p.fetch_creators().await })
+        });
 
-        let results = join_all(tasks).await;
+        let mut results = fan_out(tasks, provider_deadline()).await;
+        let any_success = results.any_success();
+        let ok = std::mem::take(&mut results.ok);
+        let errors = results.into_errors();
         let mut creators_map: BTreeMap<String, Creator> = BTreeMap::new();
-        let mut any_success = false;
-        let mut last_error = String::new();
 
-        for (prov_id, res) in results {
-            match res {
-                Ok(creators) => {
-                    any_success = true;
-                    for mut c in creators {
-                        let key = format!("{}:{}", c.service.to_lowercase(), c.id.to_lowercase());
-                        c.extra
-                            .entry("provider_id".to_string())
-                            .or_insert_with(|| serde_json::Value::String(prov_id.clone()));
+        for (prov_id, creators) in ok {
+            for mut c in creators {
+                let key = format!("{}:{}", c.service.to_lowercase(), c.id.to_lowercase());
+                c.extra
+                    .entry("provider_id".to_string())
+                    .or_insert_with(|| serde_json::Value::String(prov_id.clone()));
 
-                        if let Some(existing) = creators_map.get_mut(&key) {
-                            let max_fav = match (existing.favorited, c.favorited) {
-                                (Some(a), Some(b)) => Some(a.max(b)),
-                                (Some(a), None) => Some(a),
-                                (None, Some(b)) => Some(b),
-                                (None, None) => None,
-                            };
-                            let mut provider_ids: Vec<String> = match existing
-                                .extra
-                                .get("provider_ids")
+                if let Some(existing) = creators_map.get_mut(&key) {
+                    let max_fav = match (existing.favorited, c.favorited) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (Some(a), None) => Some(a),
+                        (None, Some(b)) => Some(b),
+                        (None, None) => None,
+                    };
+                    let mut provider_ids: Vec<String> = match existing.extra.get("provider_ids") {
+                        Some(serde_json::Value::Array(arr)) => arr
+                            .iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect(),
+                        _ => {
+                            let mut pids = Vec::new();
+                            if let Some(pid) =
+                                existing.extra.get("provider_id").and_then(|v| v.as_str())
                             {
-                                Some(serde_json::Value::Array(arr)) => arr
-                                    .iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect(),
-                                _ => {
-                                    let mut pids = Vec::new();
-                                    if let Some(pid) =
-                                        existing.extra.get("provider_id").and_then(|v| v.as_str())
-                                    {
-                                        pids.push(pid.to_string());
-                                    }
-                                    pids
-                                }
-                            };
-                            if !provider_ids.contains(&prov_id) {
-                                provider_ids.push(prov_id.clone());
+                                pids.push(pid.to_string());
                             }
-
-                            if c.updated.unwrap_or(0) > existing.updated.unwrap_or(0) {
-                                *existing = c;
-                            }
-                            existing.favorited = max_fav;
-                            existing.extra.insert(
-                                "provider_ids".to_string(),
-                                serde_json::Value::Array(
-                                    provider_ids
-                                        .into_iter()
-                                        .map(serde_json::Value::String)
-                                        .collect(),
-                                ),
-                            );
-                        } else {
-                            c.extra.insert(
-                                "provider_ids".to_string(),
-                                serde_json::Value::Array(vec![serde_json::Value::String(
-                                    prov_id.clone(),
-                                )]),
-                            );
-                            creators_map.insert(key, c);
+                            pids
                         }
+                    };
+                    if !provider_ids.contains(&prov_id) {
+                        provider_ids.push(prov_id.clone());
                     }
-                }
-                Err(e) => {
-                    last_error = e;
+
+                    if c.updated.unwrap_or(0) > existing.updated.unwrap_or(0) {
+                        *existing = c;
+                    }
+                    existing.favorited = max_fav;
+                    existing.extra.insert(
+                        "provider_ids".to_string(),
+                        serde_json::Value::Array(
+                            provider_ids
+                                .into_iter()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        ),
+                    );
+                } else {
+                    c.extra.insert(
+                        "provider_ids".to_string(),
+                        serde_json::Value::Array(vec![serde_json::Value::String(prov_id.clone())]),
+                    );
+                    creators_map.insert(key, c);
                 }
             }
         }
 
         if !any_success {
-            return Err(format!("Failed to fetch creators: {last_error}"));
+            return Err(provider_errors("creators", errors));
         }
 
         Ok(creators_map.into_values().collect())
@@ -417,18 +608,16 @@ impl ProviderManager {
             return Err(format!("No provider configured for service '{service}'"));
         }
 
-        let mut profiles: Vec<Creator> = Vec::new();
-        let mut last_error = String::new();
-        for provider in &candidates {
-            match provider.fetch_creator_profile(service, creator_id).await {
-                Ok(profile) => profiles.push(profile),
-                Err(e) => last_error = e,
-            }
+        let tasks = candidates.into_iter().map(|p| {
+            (p.id().to_string(), async move {
+                p.fetch_creator_profile(service, creator_id).await
+            })
+        });
+        let results = fan_out(tasks, provider_deadline()).await;
+        if !results.any_success() {
+            return Err(provider_errors("creator profile", results.into_errors()));
         }
-
-        if profiles.is_empty() {
-            return Err(last_error);
-        }
+        let mut profiles: Vec<Creator> = results.ok.into_iter().map(|(_, p)| p).collect();
 
         let mut base = profiles.remove(0);
         let mut candidate_avatars: Vec<String> = Vec::new();
@@ -502,24 +691,19 @@ impl ProviderManager {
         }
 
         let candidates = self.get_providers_for_service(service).await;
-        let mut had_success = false;
-        let mut errors = Vec::new();
-        for provider in candidates {
-            match provider.fetch_creator_links(service, creator_id).await {
-                Ok(links) => {
-                    had_success = true;
-                    if !links.is_empty() {
-                        return Ok(links);
-                    }
-                }
-                Err(error) => errors.push(error),
-            }
+        let tasks = candidates.into_iter().map(|p| {
+            (p.id().to_string(), async move {
+                p.fetch_creator_links(service, creator_id).await
+            })
+        });
+        let results = fan_out(tasks, provider_deadline()).await;
+        if !results.any_success() {
+            return Err(provider_errors("creator links", results.into_errors()));
         }
-        if had_success {
-            Ok(Vec::new())
-        } else {
-            Err(provider_errors("creator links", errors))
-        }
+        Ok(dedupe_by(
+            results.ok.into_iter().map(|(_, v)| v).collect(),
+            |p| format!("{}:{}", p.service.to_lowercase(), p.id.to_lowercase()),
+        ))
     }
 
     pub async fn fetch_similar_creators(
@@ -539,24 +723,19 @@ impl ProviderManager {
         }
 
         let candidates = self.get_providers_for_service(service).await;
-        let mut had_success = false;
-        let mut errors = Vec::new();
-        for provider in candidates {
-            match provider.fetch_similar_creators(service, creator_id).await {
-                Ok(similar) => {
-                    had_success = true;
-                    if !similar.is_empty() {
-                        return Ok(similar);
-                    }
-                }
-                Err(error) => errors.push(error),
-            }
+        let tasks = candidates.into_iter().map(|p| {
+            (p.id().to_string(), async move {
+                p.fetch_similar_creators(service, creator_id).await
+            })
+        });
+        let results = fan_out(tasks, provider_deadline()).await;
+        if !results.any_success() {
+            return Err(provider_errors("similar creators", results.into_errors()));
         }
-        if had_success {
-            Ok(Vec::new())
-        } else {
-            Err(provider_errors("similar creators", errors))
-        }
+        Ok(dedupe_by(
+            results.ok.into_iter().map(|(_, v)| v).collect(),
+            |p| format!("{}:{}", p.service.to_lowercase(), p.id.to_lowercase()),
+        ))
     }
 
     pub async fn fetch_creator_tags(
@@ -576,24 +755,19 @@ impl ProviderManager {
         }
 
         let candidates = self.get_providers_for_service(service).await;
-        let mut had_success = false;
-        let mut errors = Vec::new();
-        for provider in candidates {
-            match provider.fetch_creator_tags(service, creator_id).await {
-                Ok(tags) => {
-                    had_success = true;
-                    if !tags.is_empty() {
-                        return Ok(tags);
-                    }
-                }
-                Err(error) => errors.push(error),
-            }
+        let tasks = candidates.into_iter().map(|p| {
+            (p.id().to_string(), async move {
+                p.fetch_creator_tags(service, creator_id).await
+            })
+        });
+        let results = fan_out(tasks, provider_deadline()).await;
+        if !results.any_success() {
+            return Err(provider_errors("creator tags", results.into_errors()));
         }
-        if had_success {
-            Ok(Vec::new())
-        } else {
-            Err(provider_errors("creator tags", errors))
-        }
+        Ok(dedupe_by(
+            results.ok.into_iter().map(|(_, v)| v).collect(),
+            |t: &String| t.to_lowercase(),
+        ))
     }
 
     pub async fn fetch_announcements(
@@ -613,24 +787,19 @@ impl ProviderManager {
         }
 
         let candidates = self.get_providers_for_service(service).await;
-        let mut had_success = false;
-        let mut errors = Vec::new();
-        for provider in candidates {
-            match provider.fetch_announcements(service, creator_id).await {
-                Ok(items) => {
-                    had_success = true;
-                    if !items.is_empty() {
-                        return Ok(items);
-                    }
-                }
-                Err(error) => errors.push(error),
-            }
+        let tasks = candidates.into_iter().map(|p| {
+            (p.id().to_string(), async move {
+                p.fetch_announcements(service, creator_id).await
+            })
+        });
+        let results = fan_out(tasks, provider_deadline()).await;
+        if !results.any_success() {
+            return Err(provider_errors("announcements", results.into_errors()));
         }
-        if had_success {
-            Ok(Vec::new())
-        } else {
-            Err(provider_errors("announcements", errors))
-        }
+        Ok(dedupe_by(
+            results.ok.into_iter().map(|(_, v)| v).collect(),
+            |a| a.hash.clone(),
+        ))
     }
 
     pub async fn fetch_posts(
@@ -640,6 +809,19 @@ impl ProviderManager {
         offset: u32,
         query: Option<&str>,
         provider_id: Option<&str>,
+    ) -> Result<Vec<Post>, String> {
+        self.fetch_posts_streaming(service, creator_id, offset, query, provider_id, |_, _| {})
+            .await
+    }
+
+    pub async fn fetch_posts_streaming(
+        &self,
+        service: &str,
+        creator_id: &str,
+        offset: u32,
+        query: Option<&str>,
+        provider_id: Option<&str>,
+        on_batch: impl FnMut(&str, &Vec<Post>),
     ) -> Result<Vec<Post>, String> {
         if let Some(pid) = provider_id {
             if pid != "auto" {
@@ -656,28 +838,19 @@ impl ProviderManager {
             return Err(format!("No provider configured for service '{service}'"));
         }
 
-        let mut had_empty_success = false;
-        let mut last_error = String::new();
-        for provider in candidates {
-            match provider
-                .fetch_posts(service, creator_id, offset, query)
-                .await
-            {
-                Ok(posts) => {
-                    if !posts.is_empty() {
-                        return Ok(posts);
-                    }
-                    had_empty_success = true;
-                }
-                Err(e) => last_error = e,
-            }
+        let tasks = candidates.into_iter().map(|p| {
+            (p.id().to_string(), async move {
+                let posts = p.fetch_posts(service, creator_id, offset, query).await?;
+                Ok(self.enriched_batch(p.id(), posts).await)
+            })
+        });
+        let results = fan_out_streaming(tasks, on_batch).await;
+        if !results.is_conclusive() {
+            return Err(provider_errors("creator posts", results.into_errors()));
         }
-
-        if had_empty_success {
-            Ok(Vec::new())
-        } else {
-            Err(last_error)
-        }
+        let mut posts = dedupe_posts(results.ok.into_iter().map(|(_, p)| p).collect());
+        sort_by_published_desc(&mut posts);
+        Ok(posts)
     }
 
     pub async fn fetch_post(
@@ -718,29 +891,26 @@ impl ProviderManager {
             return Err(format!("No provider configured for service '{service}'"));
         }
 
-        let tasks: Vec<_> = candidates
-            .iter()
-            .map(|p| {
-                let p = p.clone();
-                let conf = p.config();
-                async move {
-                    let post_opt = p
-                        .fetch_post(service, creator_id, post_id)
-                        .await
-                        .ok()
-                        .flatten();
-                    post_opt.map(|mut post| {
-                        post.extra
-                            .entry("provider_id".to_string())
-                            .or_insert_with(|| serde_json::Value::String(conf.id.clone()));
-                        (conf.id.clone(), post)
-                    })
-                }
+        let tasks = candidates.iter().map(|p| {
+            let p = p.clone();
+            let conf = p.config();
+            (conf.id.clone(), async move {
+                let post_opt = p.fetch_post(service, creator_id, post_id).await?;
+                Ok(post_opt.map(|mut post| {
+                    post.extra
+                        .entry("provider_id".to_string())
+                        .or_insert_with(|| serde_json::Value::String(conf.id.clone()));
+                    (conf.id.clone(), post)
+                }))
             })
-            .collect();
+        });
 
-        let results = join_all(tasks).await;
-        let snapshots: Vec<(String, Post)> = results.into_iter().flatten().collect();
+        let snapshots: Vec<(String, Post)> = fan_out(tasks, provider_deadline())
+            .await
+            .ok
+            .into_iter()
+            .filter_map(|(_, found)| found)
+            .collect();
 
         if snapshots.is_empty() {
             return Ok(None);
@@ -769,23 +939,22 @@ impl ProviderManager {
         post_id: &str,
     ) -> Result<Vec<PostRevision>, String> {
         let candidates = self.get_providers_for_service(service).await;
+        let tasks = candidates.into_iter().map(|p| {
+            (p.id().to_string(), async move {
+                p.fetch_post_revisions(service, creator_id, post_id).await
+            })
+        });
+
         let mut all_revs = Vec::new();
         let mut seen_keys = std::collections::HashSet::new();
-        for provider in candidates {
-            let pid = provider.config().id.clone();
-            if let Ok(revs) = provider
-                .fetch_post_revisions(service, creator_id, post_id)
-                .await
-            {
-                for mut r in revs {
-                    r.post
-                        .extra
-                        .entry("provider_id".to_string())
-                        .or_insert_with(|| serde_json::Value::String(pid.clone()));
-                    let key = (pid.clone(), r.revision_id);
-                    if seen_keys.insert(key) {
-                        all_revs.push(r);
-                    }
+        for (pid, revs) in fan_out(tasks, provider_deadline()).await.ok {
+            for mut r in revs {
+                r.post
+                    .extra
+                    .entry("provider_id".to_string())
+                    .or_insert_with(|| serde_json::Value::String(pid.clone()));
+                if seen_keys.insert((pid.clone(), r.revision_id)) {
+                    all_revs.push(r);
                 }
             }
         }
@@ -797,62 +966,35 @@ impl ProviderManager {
         query: Option<&str>,
         offset: u32,
     ) -> Result<Vec<Post>, String> {
+        self.fetch_recent_posts_streaming(query, offset, |_, _| {})
+            .await
+    }
+
+    pub async fn fetch_recent_posts_streaming(
+        &self,
+        query: Option<&str>,
+        offset: u32,
+        on_batch: impl FnMut(&str, &Vec<Post>),
+    ) -> Result<Vec<Post>, String> {
         let enabled = self.get_all_enabled_providers().await;
         if enabled.is_empty() {
             return Err("No enabled providers configured".to_string());
         }
 
-        let tasks: Vec<_> = enabled
-            .iter()
-            .map(|p| {
-                let p = p.clone();
-                async move { p.fetch_recent_posts(query, offset).await }
+        let tasks = enabled.iter().map(|p| {
+            let p = p.clone();
+            (p.id().to_string(), async move {
+                let posts = p.fetch_recent_posts(query, offset).await?;
+                Ok(self.enriched_batch(p.id(), posts).await)
             })
-            .collect();
-
-        let results = join_all(tasks).await;
-        let mut all_posts: Vec<Post> = Vec::new();
-        let mut any_success = false;
-        let mut last_error = String::new();
-
-        for res in results {
-            match res {
-                Ok(posts) => {
-                    any_success = true;
-                    all_posts.extend(posts);
-                }
-                Err(e) => {
-                    last_error = e;
-                }
-            }
-        }
-
-        if !any_success {
-            return Err(format!("Failed to fetch recent posts: {last_error}"));
-        }
-
-        let mut seen = HashSet::new();
-        all_posts.retain(|p| {
-            let key = format!("{}:{}", p.service.to_lowercase(), p.id);
-            seen.insert(key)
         });
 
-        all_posts.sort_by(|a, b| {
-            let ts_a = a
-                .published
-                .as_deref()
-                .or(a.added.as_deref())
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0);
-            let ts_b = b
-                .published
-                .as_deref()
-                .or(b.added.as_deref())
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0);
-            ts_b.cmp(&ts_a)
-        });
-
+        let results = fan_out_streaming(tasks, on_batch).await;
+        if !results.is_conclusive() {
+            return Err(provider_errors("recent posts", results.into_errors()));
+        }
+        let mut all_posts = dedupe_posts(results.ok.into_iter().map(|(_, p)| p).collect());
+        sort_by_published_desc(&mut all_posts);
         Ok(all_posts)
     }
 
@@ -862,52 +1004,36 @@ impl ProviderManager {
         date: Option<&str>,
         offset: u32,
     ) -> Result<Vec<Post>, String> {
+        self.fetch_popular_posts_streaming(period, date, offset, |_, _| {})
+            .await
+    }
+
+    pub async fn fetch_popular_posts_streaming(
+        &self,
+        period: &str,
+        date: Option<&str>,
+        offset: u32,
+        on_batch: impl FnMut(&str, &Vec<Post>),
+    ) -> Result<Vec<Post>, String> {
         let enabled = self.get_all_enabled_providers().await;
         if enabled.is_empty() {
             return Err("No enabled providers configured".to_string());
         }
 
-        let tasks: Vec<_> = enabled
-            .iter()
-            .map(|p| {
-                let p = p.clone();
-                async move { p.fetch_popular_posts(period, date, offset).await }
+        let tasks = enabled.iter().map(|p| {
+            let p = p.clone();
+            (p.id().to_string(), async move {
+                let posts = p.fetch_popular_posts(period, date, offset).await?;
+                Ok(self.enriched_batch(p.id(), posts).await)
             })
-            .collect();
-
-        let results = join_all(tasks).await;
-        let mut all_posts: Vec<Post> = Vec::new();
-        let mut any_success = false;
-        let mut last_error = String::new();
-
-        for res in results {
-            match res {
-                Ok(posts) => {
-                    any_success = true;
-                    all_posts.extend(posts);
-                }
-                Err(e) => {
-                    last_error = e;
-                }
-            }
-        }
-
-        if !any_success {
-            return Err(format!("Failed to fetch popular posts: {last_error}"));
-        }
-
-        let mut seen = HashSet::new();
-        all_posts.retain(|p| {
-            let key = format!("{}:{}", p.service.to_lowercase(), p.id);
-            seen.insert(key)
         });
 
-        all_posts.sort_by(|a, b| {
-            let fav_a = a.favorite_count.unwrap_or(0);
-            let fav_b = b.favorite_count.unwrap_or(0);
-            fav_b.cmp(&fav_a)
-        });
-
+        let results = fan_out_streaming(tasks, on_batch).await;
+        if !results.is_conclusive() {
+            return Err(provider_errors("popular posts", results.into_errors()));
+        }
+        let mut all_posts = dedupe_posts(results.ok.into_iter().map(|(_, p)| p).collect());
+        all_posts.sort_by_key(|post| std::cmp::Reverse(post.favorite_count.unwrap_or(0)));
         Ok(all_posts)
     }
 
@@ -918,17 +1044,16 @@ impl ProviderManager {
         post_id: &str,
     ) -> Result<Vec<Comment>, String> {
         let candidates = self.get_providers_for_service(service).await;
-        for provider in candidates {
-            if let Ok(comments) = provider
-                .fetch_post_comments(service, creator_id, post_id)
-                .await
-            {
-                if !comments.is_empty() {
-                    return Ok(comments);
-                }
-            }
-        }
-        Ok(Vec::new())
+        let tasks = candidates.into_iter().map(|p| {
+            (p.id().to_string(), async move {
+                p.fetch_post_comments(service, creator_id, post_id).await
+            })
+        });
+        let results = fan_out(tasks, provider_deadline()).await;
+        Ok(dedupe_by(
+            results.ok.into_iter().map(|(_, v)| v).collect(),
+            |c| c.id.clone(),
+        ))
     }
 
     pub async fn fetch_account_favorites(
@@ -942,28 +1067,29 @@ impl ProviderManager {
             }
         }
         let enabled = self.get_all_enabled_providers().await;
+        let tasks = enabled.into_iter().map(|p| {
+            (p.id().to_string(), async move {
+                p.fetch_account_favorites(favorite_type).await
+            })
+        });
+
+        let results = fan_out(tasks, provider_deadline()).await;
+        if !results.any_success() {
+            return Err(provider_errors("favorites", results.into_errors()));
+        }
+
         let mut all_favorites = Vec::new();
         let mut seen_keys = HashSet::new();
-        let mut any_success = false;
-
-        for provider in enabled {
-            if let Ok(favs) = provider.fetch_account_favorites(favorite_type).await {
-                any_success = true;
-                for fav in favs {
-                    let srv = fav.service.as_deref().unwrap_or("").to_lowercase();
-                    let id = fav.id.to_lowercase();
-                    if seen_keys.insert((srv, id)) {
-                        all_favorites.push(fav);
-                    }
+        for (_, favs) in results.ok {
+            for fav in favs {
+                let srv = fav.service.as_deref().unwrap_or("").to_lowercase();
+                let id = fav.id.to_lowercase();
+                if seen_keys.insert((srv, id)) {
+                    all_favorites.push(fav);
                 }
             }
         }
-
-        if any_success {
-            Ok(all_favorites)
-        } else {
-            Err("No provider available for favorites".to_string())
-        }
+        Ok(all_favorites)
     }
 
     pub async fn set_creator_favorite(
@@ -1648,7 +1774,6 @@ impl ProviderManager {
         let s = sanitize_cache_key(&profile.service);
         let id = sanitize_cache_key(&profile.id);
         let specific_provider = prov_id.as_deref().filter(|pid| *pid != "auto");
-        let generic_provider = specific_provider.is_none();
 
         for kind in ["avatar", "banner"] {
             let current = if kind == "banner" {
@@ -1660,17 +1785,17 @@ impl ProviderManager {
                 continue;
             }
 
-            let mut found = None;
-            if let Some(pid) = specific_provider {
-                let p_san = sanitize_cache_key(pid);
-                found = self
-                    .cached_artwork_path(kind, &format!("{s}_{id}_{p_san}_{kind}"))
-                    .await;
-            }
-            if found.is_none() && generic_provider {
-                found = self
-                    .cached_artwork_path(kind, &format!("{s}_{id}_{kind}"))
-                    .await;
+            let mut found = self
+                .cached_artwork_path(kind, &format!("{s}_{id}_{kind}"))
+                .await;
+
+            if found.is_none() {
+                if let Some(pid) = specific_provider {
+                    let p_san = sanitize_cache_key(pid);
+                    found = self
+                        .cached_artwork_path(kind, &format!("{s}_{id}_{p_san}_{kind}"))
+                        .await;
+                }
             }
 
             if kind == "banner" {
@@ -1679,6 +1804,19 @@ impl ProviderManager {
                 profile.avatar_path = found;
             }
         }
+    }
+
+    async fn enriched_batch(&self, provider_id: &str, mut posts: Vec<Post>) -> Vec<Post> {
+        for post in &mut posts {
+            if !post.extra.contains_key("provider_id") {
+                post.extra.insert(
+                    "provider_id".to_string(),
+                    serde_json::Value::String(provider_id.to_string()),
+                );
+            }
+            self.enrich_post(post).await;
+        }
+        posts
     }
 
     pub async fn enrich_post(&self, post: &mut Post) {
@@ -1793,20 +1931,35 @@ impl ProviderManager {
         }
 
         if post.preview_path.is_none() {
+            let thumbs_dir = thumbs_cache_path();
             let s = sanitize_cache_key(&post.service);
             let u = sanitize_cache_key(&post.user);
             let id = sanitize_cache_key(&post.id);
-            let thumb_dir = content_cache_path().join("thumbnails");
-            for prefix in &[format!("post_{s}_{u}_{id}"), format!("{s}_{u}_{id}")] {
-                for ext in &["webp", "jpg", "jpeg", "png", "gif", "mp4", "webm"] {
-                    let p = thumb_dir.join(format!("{prefix}.{ext}"));
-                    if p.is_file() {
-                        post.preview_path = Some(p.to_string_lossy().into_owned());
-                        break;
+            for ext in &["webp", "jpg", "png"] {
+                let p = thumbs_dir.join(format!("post_{s}_{u}_{id}.{ext}"));
+                if p.is_file() {
+                    post.preview_path = Some(p.to_string_lossy().into_owned());
+                    break;
+                }
+            }
+            if post.preview_path.is_none() {
+                if let Some(media_id) = post.file.as_ref().and_then(|f| f.path.as_deref()) {
+                    let s_mid = sanitize_cache_key(media_id);
+                    for ext in &["webp", "jpg", "png"] {
+                        let p = thumbs_dir.join(format!("{s_mid}.{ext}"));
+                        if p.is_file() {
+                            post.preview_path = Some(p.to_string_lossy().into_owned());
+                            break;
+                        }
                     }
                 }
-                if post.preview_path.is_some() {
-                    break;
+            }
+            if post.preview_path.is_none() {
+                let post_key = format!("post:{}:{}:{}", post.service, post.user, post.id);
+                let hash = format!("{:x}", Sha256::digest(post_key.as_bytes()));
+                let p = thumbs_dir.join(format!("{hash}.webp"));
+                if p.is_file() {
+                    post.preview_path = Some(p.to_string_lossy().into_owned());
                 }
             }
         }
@@ -1916,15 +2069,20 @@ impl ProviderManager {
         }
 
         let candidates = self.get_providers_for_service(service).await;
-        for provider in candidates {
-            if let Ok(mut cards) = provider.fetch_fancards(service, creator_id).await {
-                if !cards.is_empty() {
-                    enrich_cards(&mut cards, &provider);
-                    return Ok(cards);
-                }
-            }
-        }
-        Ok(Vec::new())
+        let tasks = candidates.into_iter().map(|p| {
+            let id = p.id().to_string();
+            let provider = p.clone();
+            (id, async move {
+                let mut cards = p.fetch_fancards(service, creator_id).await?;
+                enrich_cards(&mut cards, &provider);
+                Ok(cards)
+            })
+        });
+        let results = fan_out(tasks, provider_deadline()).await;
+        Ok(dedupe_by(
+            results.ok.into_iter().map(|(_, v)| v).collect(),
+            |card: &Fancard| card.hash.clone(),
+        ))
     }
 
     pub async fn flag_post(
@@ -1949,12 +2107,18 @@ impl ProviderManager {
         post_id: &str,
     ) -> Result<bool, String> {
         let candidates = self.get_providers_for_service(service).await;
-        for p in candidates {
-            if let Ok(flagged) = p.is_post_flagged(service, creator_id, post_id).await {
-                return Ok(flagged);
-            }
-        }
-        Ok(false)
+        let tasks = candidates.into_iter().map(|p| {
+            (p.id().to_string(), async move {
+                p.is_post_flagged(service, creator_id, post_id).await
+            })
+        });
+        Ok(fan_out(tasks, provider_deadline())
+            .await
+            .ok
+            .into_iter()
+            .next()
+            .map(|(_, flagged)| flagged)
+            .unwrap_or(false))
     }
 
     pub async fn login(
@@ -2012,18 +2176,165 @@ impl ProviderManager {
 
     pub async fn expand_short_link(&self, raw_url: &str) -> Result<Option<String>, String> {
         let enabled = self.get_all_enabled_providers().await;
-        for p in enabled {
-            if let Ok(Some(res)) = p.expand_short_link(raw_url).await {
-                return Ok(Some(res));
-            }
-        }
-        Ok(None)
+        let tasks = enabled.into_iter().map(|p| {
+            (p.id().to_string(), async move {
+                p.expand_short_link(raw_url).await
+            })
+        });
+        Ok(fan_out(tasks, provider_deadline())
+            .await
+            .ok
+            .into_iter()
+            .find_map(|(_, expanded)| expanded))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fan_out_keeps_priority_order_and_drops_stragglers() {
+        let deadline = Duration::from_millis(120);
+        let started = tokio::time::Instant::now();
+
+        let results = fan_out(
+            vec![
+                (
+                    "fast".to_string(),
+                    Box::pin(async { Ok::<Vec<i32>, String>(vec![1]) })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>,
+                ),
+                (
+                    "broken".to_string(),
+                    Box::pin(async { Err("upstream refused".to_string()) }),
+                ),
+                (
+                    "hung".to_string(),
+                    Box::pin(async {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        Ok(vec![2])
+                    }),
+                ),
+                (
+                    "slow-but-inside".to_string(),
+                    Box::pin(async {
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        Ok(vec![3])
+                    }),
+                ),
+            ],
+            deadline,
+        )
+        .await;
+
+        assert!(started.elapsed() < deadline * 3);
+        assert_eq!(
+            results.ok,
+            vec![
+                ("fast".to_string(), vec![1]),
+                ("slow-but-inside".to_string(), vec![3])
+            ]
+        );
+        assert_eq!(results.timed_out, vec!["hung".to_string()]);
+        assert!(results.any_success());
+
+        let errors = results.into_errors();
+        assert_eq!(errors.len(), 2);
+        assert!(errors.iter().any(|e| e.contains("upstream refused")));
+        assert!(errors.iter().any(|e| e.contains("'hung' timed out")));
+    }
+
+    #[tokio::test]
+    async fn fan_out_waits_past_the_deadline_while_nothing_has_data() {
+        let deadline = Duration::from_millis(30);
+        let results = fan_out(
+            vec![
+                (
+                    "empty-mirror".to_string(),
+                    Box::pin(async { Ok::<Vec<i32>, String>(Vec::new()) })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>,
+                ),
+                (
+                    "slow-with-posts".to_string(),
+                    Box::pin(async {
+                        tokio::time::sleep(Duration::from_millis(120)).await;
+                        Ok(vec![7])
+                    }),
+                ),
+            ],
+            deadline,
+        )
+        .await;
+
+        assert_eq!(
+            results.ok,
+            vec![
+                ("empty-mirror".to_string(), Vec::new()),
+                ("slow-with-posts".to_string(), vec![7])
+            ]
+        );
+        assert!(results.timed_out.is_empty());
+        assert!(results.is_conclusive());
+    }
+
+    #[tokio::test]
+    async fn streaming_fan_out_waits_for_every_provider() {
+        let mut seen = Vec::new();
+        let results = fan_out_streaming(
+            vec![
+                (
+                    "slow".to_string(),
+                    Box::pin(async {
+                        tokio::time::sleep(Duration::from_millis(60)).await;
+                        Ok::<Vec<i32>, String>(vec![2])
+                    })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>,
+                ),
+                ("fast".to_string(), Box::pin(async { Ok(vec![1]) })),
+            ],
+            |id, _| seen.push(id.to_string()),
+        )
+        .await;
+
+        assert_eq!(seen, ["fast", "slow"]);
+        assert_eq!(
+            results.ok,
+            vec![("slow".to_string(), vec![2]), ("fast".to_string(), vec![1])]
+        );
+    }
+
+    #[test]
+    fn empty_answer_is_inconclusive_while_a_provider_timed_out() {
+        let partial: FanOut<Vec<i32>> = FanOut {
+            ok: vec![("empty".to_string(), Vec::new())],
+            errors: Vec::new(),
+            timed_out: vec!["slow".to_string()],
+        };
+        assert!(!partial.is_conclusive());
+
+        let complete: FanOut<Vec<i32>> = FanOut {
+            ok: vec![("empty".to_string(), Vec::new())],
+            errors: vec!["404".to_string()],
+            timed_out: Vec::new(),
+        };
+        assert!(complete.is_conclusive());
+    }
+
+    #[tokio::test]
+    async fn fan_out_reports_total_failure_without_any_success() {
+        let results: FanOut<Vec<i32>> = fan_out(
+            vec![("only".to_string(), async { Err("dead".to_string()) })],
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(!results.any_success());
+        assert_eq!(
+            provider_errors("posts", results.into_errors()),
+            "All providers failed to fetch posts: dead"
+        );
+    }
 
     fn enabled(mut config: ProviderConfig, priority: u32) -> ProviderConfig {
         config.enabled = true;
@@ -2106,6 +2417,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits live provider APIs; run with `cargo test -- --ignored`"]
     async fn live_manager_multi_provider_contracts() {
         let coomer = enabled(CoomerProvider::default_config(), 1);
         let coomer_id = coomer.id.clone();
@@ -2241,6 +2553,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits live provider APIs; run with `cargo test -- --ignored`"]
     async fn live_capabilities_and_coomer_popular_periods() {
         let coomer = enabled(CoomerProvider::default_config(), 1);
         let coomer_id = coomer.id.clone();

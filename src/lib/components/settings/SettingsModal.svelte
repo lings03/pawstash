@@ -20,6 +20,11 @@
     apiClearAllContentCache,
     apiGetCacheStats,
     apiGetDefaultSettings,
+    apiGetNetworkDefaults,
+    FALLBACK_NETWORK_DEFAULTS,
+    apiGetWebviewProxyStatus,
+    type NetworkDefaults,
+    type WebviewProxyStatus,
     apiGetSettings,
     apiSaveSettings,
     apiUpdatePanicKey,
@@ -147,6 +152,29 @@
 
   let settings = $state({ ...configState.settings });
   let defaultSettings = $state<AppSettings>({ ...configState.settings });
+
+  let networkDefaults = $state<NetworkDefaults>({ ...FALLBACK_NETWORK_DEFAULTS });
+  let networkAdvancedOpen = $state(false);
+
+  let webviewProxy = $state<WebviewProxyStatus | null>(null);
+  let webviewProxyNotice = $derived.by(() => {
+    if (!webviewProxy?.needed && !webviewProxy?.active) return null;
+    if (!webviewProxy.supported) return i18n.t('settings.webview_proxy_unsupported');
+    if (webviewProxy.needed !== webviewProxy.active) return i18n.t('settings.webview_proxy_restart');
+    return null;
+  });
+
+  function refreshWebviewProxyStatus() {
+    void apiGetWebviewProxyStatus()
+      .then((status) => (webviewProxy = status))
+      .catch((err) => logger.warn('Failed to read WebView proxy status:', err));
+  }
+
+  // Reading providers subscribes to them: a provider proxy can require the WebView proxy.
+  $effect(() => {
+    void providerState.providers;
+    refreshWebviewProxyStatus();
+  });
   let resetPending = $state(false);
   let settingsMenuOpen = $state(false);
   let stickySettingsMenuOpen = $state(false);
@@ -226,7 +254,8 @@
       id: `provider-${p.id}`,
       label: formatProviderName(p.name || p.id)
     })),
-    { id: 'proxy', label: i18n.t('settings.proxy_section') },
+    { id: 'network', label: i18n.t('settings.network_section') },
+    { id: 'links', label: i18n.t('settings.links_section') },
     { id: 'downloads', label: i18n.t('settings.download_section') },
     { id: 'notifications', label: i18n.t('settings.notifications_section') },
     { id: 'cache', label: i18n.t('settings.cache_section') },
@@ -236,6 +265,22 @@
 
   onMount(() => {
     availableBackgroundTypes = supportedBackgroundTypes();
+
+    void apiGetNetworkDefaults()
+      .then((defaults) => {
+        networkDefaults = defaults;
+      })
+      .catch((err) => {
+        logger.warn('Failed to fetch network defaults:', err);
+      });
+
+    networkAdvancedOpen = Boolean(
+      settings.network_api_user_agent ||
+        settings.network_browser_user_agent ||
+        settings.network_timeout_secs ||
+        settings.network_connect_timeout_secs ||
+        settings.provider_deadline_secs
+    );
 
     void apiGetDefaultSettings()
       .then((defaults) => {
@@ -420,6 +465,7 @@
     try {
       await apiSaveSettings(nextSettings);
       if (key === 'cache_max_mb') await loadCacheStats();
+      refreshWebviewProxyStatus();
     } catch (err: any) {
       (settings as any)[key] = previousValue;
       configState.updateSettings({ ...settings });
@@ -598,6 +644,7 @@
           next.sticky_header = defaults.sticky_header;
           next.layout_mode = defaults.layout_mode;
           next.scroll_edge_mask = defaults.scroll_edge_mask;
+          next.linux_transparent_window = defaults.linux_transparent_window;
           next.titlebar_style = defaults.titlebar_style;
           next.toast_position = defaults.toast_position;
           break;
@@ -606,6 +653,27 @@
           next.grid_aspect_ratio = defaults.grid_aspect_ratio;
           next.grid_scale = defaults.grid_scale;
           next.card_view_mode = defaults.card_view_mode;
+          break;
+
+        case 'network':
+          next.proxy_mode = defaults.proxy_mode;
+          next.proxy_url = defaults.proxy_url;
+          next.proxy_username = defaults.proxy_username;
+          next.proxy_password = defaults.proxy_password;
+          next.proxy_bypass_local = defaults.proxy_bypass_local;
+          next.network_api_user_agent = defaults.network_api_user_agent;
+          next.network_browser_user_agent = defaults.network_browser_user_agent;
+          next.network_timeout_secs = defaults.network_timeout_secs;
+          next.network_connect_timeout_secs = defaults.network_connect_timeout_secs;
+          next.provider_deadline_secs = defaults.provider_deadline_secs;
+          break;
+
+        case 'links':
+          next.cloud_scraping_enabled = defaults.cloud_scraping_enabled;
+          next.cloud_proxy_url = defaults.cloud_proxy_url;
+          next.cloud_user_agent = defaults.cloud_user_agent;
+          next.cloud_timeout_secs = defaults.cloud_timeout_secs;
+          next.cloud_max_redirects = defaults.cloud_max_redirects;
           break;
 
         case 'downloads':
@@ -617,6 +685,9 @@
           next.download_group_by_post = defaults.download_group_by_post;
           next.download_post_folder_template = defaults.download_post_folder_template;
           next.download_filename_template = defaults.download_filename_template;
+          next.download_max_concurrent = defaults.download_max_concurrent;
+          next.download_auto_retry = defaults.download_auto_retry;
+          next.download_auto_retry_max = defaults.download_auto_retry_max;
           break;
 
         case 'notifications':
@@ -644,9 +715,10 @@
       settings = next;
       configState.updateSettings(next);
       await apiSaveSettings(next);
+      refreshWebviewProxyStatus();
       notify.success(
         i18n.t('settings.reset_section_success'),
-        i18n.t(`settings.section_${sectionId}`)
+        categories.find((category) => category.id === sectionId)?.label ?? sectionId
       );
     } catch (err) {
       notify.error(i18n.t('settings.reset_failed'), err);
@@ -1306,6 +1378,24 @@
           />
         </SettingItem>
 
+        {#if layoutState.isLinux}
+          <SettingItem
+            title={i18n.t('settings.linux_transparent_window')}
+            description={i18n.t('settings.linux_transparent_window_desc')}
+            icon={IconWindowApps}
+            align="right"
+            value={settings.linux_transparent_window ?? false}
+            defaultValue={defaultSettings.linux_transparent_window ?? false}
+            onReset={() => resetSetting('linux_transparent_window')}
+          >
+            <Toggle
+              checked={settings.linux_transparent_window ?? false}
+              ariaLabel={i18n.t('settings.linux_transparent_window')}
+              onchange={(value) => updateAndSaveSetting('linux_transparent_window', value)}
+            />
+          </SettingItem>
+        {/if}
+
         <SettingItem
           title={i18n.t('settings.scroll_edge_mask')}
           description={i18n.t('settings.scroll_edge_mask_desc')}
@@ -1698,8 +1788,8 @@
 
     <ProviderSettings />
 
-    <div id="settings-proxy" class="settings-section">
-      <SectionTitle icon={IconGlobe} title={i18n.t('settings.proxy_section')} onreset={() => (sectionToReset = 'proxy')} />
+    <div id="settings-network" class="settings-section">
+      <SectionTitle icon={IconGlobe} title={i18n.t('settings.network_section')} onreset={() => (sectionToReset = 'network')} />
 
       <div class="settings-list">
         <SettingItem
@@ -1722,6 +1812,14 @@
             compact={true}
           />
         </SettingItem>
+
+        {#if webviewProxyNotice}
+          <SettingItem
+            title={i18n.t('settings.webview_proxy_title')}
+            description={webviewProxyNotice}
+            icon={IconWarning}
+          />
+        {/if}
 
         {#if settings.proxy_mode === 'custom'}
           <SettingItem
@@ -1791,6 +1889,219 @@
               checked={settings.proxy_bypass_local}
               ariaLabel={i18n.t('settings.proxy_bypass_local')}
               onchange={(value) => updateAndSaveSetting('proxy_bypass_local', value)}
+            />
+          </SettingItem>
+        {/if}
+
+        <SettingItem
+          title={i18n.t('settings.network_advanced')}
+          description={i18n.t('settings.network_advanced_desc')}
+          icon={IconGauge}
+          align="right"
+        >
+          <Button
+            variant="ghost"
+            size="sm"
+            aria-expanded={networkAdvancedOpen}
+            onclick={() => (networkAdvancedOpen = !networkAdvancedOpen)}
+          >
+            <span>{networkAdvancedOpen ? i18n.t('common.collapse') : i18n.t('common.expand')}</span>
+            <IconChevronRight
+              class="w-4 h-4 transition-transform duration-200 {networkAdvancedOpen ? 'rotate-90' : ''}"
+            />
+          </Button>
+        </SettingItem>
+
+        {#if networkAdvancedOpen}
+          <SettingItem
+            title={i18n.t('settings.network_api_user_agent')}
+            description={i18n.t('settings.network_api_user_agent_desc')}
+            icon={IconCode}
+            value={settings.network_api_user_agent}
+            defaultValue={defaultSettings.network_api_user_agent}
+            onReset={() => resetSetting('network_api_user_agent')}
+          >
+            <div class="w-full">
+              <Input
+                clearable={true}
+                placeholder={networkDefaults.api_user_agent}
+                bind:value={settings.network_api_user_agent}
+                onchange={() =>
+                  updateAndSaveSetting('network_api_user_agent', settings.network_api_user_agent)}
+              />
+            </div>
+          </SettingItem>
+
+          <SettingItem
+            title={i18n.t('settings.network_browser_user_agent')}
+            description={i18n.t('settings.network_browser_user_agent_desc')}
+            icon={IconGlobe}
+            value={settings.network_browser_user_agent}
+            defaultValue={defaultSettings.network_browser_user_agent}
+            onReset={() => resetSetting('network_browser_user_agent')}
+          >
+            <div class="w-full">
+              <Input
+                clearable={true}
+                placeholder={networkDefaults.browser_user_agent}
+                bind:value={settings.network_browser_user_agent}
+                onchange={() =>
+                  updateAndSaveSetting(
+                    'network_browser_user_agent',
+                    settings.network_browser_user_agent
+                  )}
+              />
+            </div>
+          </SettingItem>
+
+          <SettingItem
+            title={i18n.t('settings.network_timeout')}
+            description={i18n.t('settings.network_timeout_desc')}
+            icon={IconGauge}
+            align="right"
+            value={settings.network_timeout_secs}
+            defaultValue={defaultSettings.network_timeout_secs}
+            onReset={() => resetSetting('network_timeout_secs')}
+          >
+            <NumberStepper
+              value={settings.network_timeout_secs || networkDefaults.request_timeout_secs}
+              min={5}
+              max={600}
+              step={5}
+              onchange={(value) => updateAndSaveSetting('network_timeout_secs', value)}
+            />
+          </SettingItem>
+
+          <SettingItem
+            title={i18n.t('settings.network_connect_timeout')}
+            description={i18n.t('settings.network_connect_timeout_desc')}
+            icon={IconGauge}
+            align="right"
+            value={settings.network_connect_timeout_secs}
+            defaultValue={defaultSettings.network_connect_timeout_secs}
+            onReset={() => resetSetting('network_connect_timeout_secs')}
+          >
+            <NumberStepper
+              value={settings.network_connect_timeout_secs ||
+                networkDefaults.connect_timeout_secs}
+              min={1}
+              max={120}
+              step={1}
+              onchange={(value) => updateAndSaveSetting('network_connect_timeout_secs', value)}
+            />
+          </SettingItem>
+
+          <SettingItem
+            title={i18n.t('settings.provider_deadline')}
+            description={i18n.t('settings.provider_deadline_desc')}
+            icon={IconArrowRouting}
+            align="right"
+            value={settings.provider_deadline_secs}
+            defaultValue={defaultSettings.provider_deadline_secs}
+            onReset={() => resetSetting('provider_deadline_secs')}
+          >
+            <NumberStepper
+              value={settings.provider_deadline_secs || networkDefaults.provider_deadline_secs}
+              min={1}
+              max={120}
+              step={1}
+              onchange={(value) => updateAndSaveSetting('provider_deadline_secs', value)}
+            />
+          </SettingItem>
+        {/if}
+      </div>
+    </div>
+
+    <div id="settings-links" class="settings-section">
+      <SectionTitle icon={IconLink} title={i18n.t('settings.links_section')} onreset={() => (sectionToReset = 'links')} />
+
+      <div class="settings-list">
+        <SettingItem
+          title={i18n.t('settings.cloud_scraping_enabled')}
+          description={i18n.t('settings.cloud_scraping_enabled_desc')}
+          icon={IconGlobe}
+          align="right"
+          value={settings.cloud_scraping_enabled ?? true}
+          defaultValue={defaultSettings.cloud_scraping_enabled ?? true}
+          onReset={() => resetSetting('cloud_scraping_enabled')}
+        >
+          <Toggle
+            checked={settings.cloud_scraping_enabled ?? true}
+            ariaLabel={i18n.t('settings.cloud_scraping_enabled')}
+            onchange={(value) => updateAndSaveSetting('cloud_scraping_enabled', value)}
+          />
+        </SettingItem>
+
+        {#if settings.cloud_scraping_enabled ?? true}
+          <SettingItem
+            title={i18n.t('settings.cloud_proxy_url')}
+            description={i18n.t('settings.cloud_proxy_url_desc')}
+            icon={IconArrowRouting}
+            value={settings.cloud_proxy_url}
+            defaultValue={defaultSettings.cloud_proxy_url}
+            onReset={() => resetSetting('cloud_proxy_url')}
+          >
+            <div class="w-full">
+              <Input
+                clearable={true}
+                placeholder={i18n.t('settings.inherits_global_proxy')}
+                bind:value={settings.cloud_proxy_url}
+                onchange={() => updateAndSaveSetting('cloud_proxy_url', settings.cloud_proxy_url)}
+              />
+            </div>
+          </SettingItem>
+
+          <SettingItem
+            title={i18n.t('settings.cloud_user_agent')}
+            description={i18n.t('settings.cloud_user_agent_desc')}
+            icon={IconCode}
+            value={settings.cloud_user_agent}
+            defaultValue={defaultSettings.cloud_user_agent}
+            onReset={() => resetSetting('cloud_user_agent')}
+          >
+            <div class="w-full">
+              <Input
+                clearable={true}
+                placeholder={settings.network_browser_user_agent || networkDefaults.browser_user_agent}
+                bind:value={settings.cloud_user_agent}
+                onchange={() => updateAndSaveSetting('cloud_user_agent', settings.cloud_user_agent)}
+              />
+            </div>
+          </SettingItem>
+
+          <SettingItem
+            title={i18n.t('settings.cloud_timeout')}
+            description={i18n.t('settings.cloud_timeout_desc')}
+            icon={IconGauge}
+            align="right"
+            value={settings.cloud_timeout_secs}
+            defaultValue={defaultSettings.cloud_timeout_secs}
+            onReset={() => resetSetting('cloud_timeout_secs')}
+          >
+            <NumberStepper
+              value={settings.cloud_timeout_secs || networkDefaults.cloud_timeout_secs}
+              min={5}
+              max={600}
+              step={5}
+              onchange={(value) => updateAndSaveSetting('cloud_timeout_secs', value)}
+            />
+          </SettingItem>
+
+          <SettingItem
+            title={i18n.t('settings.cloud_max_redirects')}
+            description={i18n.t('settings.cloud_max_redirects_desc')}
+            icon={IconArrowRouting}
+            align="right"
+            value={settings.cloud_max_redirects}
+            defaultValue={defaultSettings.cloud_max_redirects}
+            onReset={() => resetSetting('cloud_max_redirects')}
+          >
+            <NumberStepper
+              value={settings.cloud_max_redirects || networkDefaults.cloud_max_redirects}
+              min={1}
+              max={30}
+              step={1}
+              onchange={(value) => updateAndSaveSetting('cloud_max_redirects', value)}
             />
           </SettingItem>
         {/if}
@@ -2009,6 +2320,40 @@
             onchange={(value) => updateAndSaveSetting('download_max_concurrent', value)}
           />
         </SettingItem>
+
+        <SettingItem
+          title={i18n.t('settings.download_auto_retry')}
+          description={i18n.t('settings.download_auto_retry_desc')}
+          icon={IconArrowSync}
+          value={settings.download_auto_retry ?? true}
+          defaultValue={defaultSettings.download_auto_retry ?? true}
+          onReset={() => resetSetting('download_auto_retry')}
+        >
+          <Toggle
+            checked={settings.download_auto_retry ?? true}
+            ariaLabel={i18n.t('settings.download_auto_retry')}
+            onchange={(val) => updateAndSaveSetting('download_auto_retry', val)}
+          />
+        </SettingItem>
+
+        {#if settings.download_auto_retry ?? true}
+          <SettingItem
+            title={i18n.t('settings.download_auto_retry_max')}
+            description={i18n.t('settings.download_auto_retry_max_desc')}
+            icon={IconArrowSync}
+            value={settings.download_auto_retry_max ?? 3}
+            defaultValue={defaultSettings.download_auto_retry_max ?? 3}
+            onReset={() => resetSetting('download_auto_retry_max')}
+          >
+            <NumberStepper
+              min={1}
+              max={10}
+              value={settings.download_auto_retry_max ?? 3}
+              ariaLabel={i18n.t('settings.download_auto_retry_max')}
+              onchange={(value) => updateAndSaveSetting('download_auto_retry_max', value)}
+            />
+          </SettingItem>
+        {/if}
 
         <SettingItem
           title={i18n.t('settings.template_preview')}

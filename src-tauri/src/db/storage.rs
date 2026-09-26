@@ -4,7 +4,7 @@ use std::time::Duration;
 
 pub const INBOX_COLLECTION_ID: &str = "00000000-0000-0000-0000-000000000001";
 
-const CURRENT_SCHEMA_VERSION: i64 = 4;
+const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS app_settings (
@@ -167,6 +167,24 @@ CREATE TABLE IF NOT EXISTS download_blob_refs (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS thumb_blobs (
+    content_key TEXT PRIMARY KEY,
+    size INTEGER NOT NULL,
+    relative_path TEXT NOT NULL UNIQUE,
+    last_access_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS thumb_refs (
+    service TEXT NOT NULL,
+    creator_id TEXT NOT NULL,
+    post_id TEXT NOT NULL,
+    media_id TEXT NOT NULL,
+    content_key TEXT NOT NULL REFERENCES thumb_blobs(content_key) ON DELETE CASCADE,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (service, creator_id, post_id, media_id)
+);
+CREATE INDEX IF NOT EXISTS idx_thumb_refs_key ON thumb_refs(content_key);
+CREATE INDEX IF NOT EXISTS idx_thumb_refs_post ON thumb_refs(service, creator_id, post_id);
+
 CREATE TABLE IF NOT EXISTS subscriptions (
     id TEXT PRIMARY KEY,
     service TEXT NOT NULL,
@@ -260,6 +278,23 @@ pub fn database_path() -> PathBuf {
 pub fn content_cache_path() -> PathBuf {
     data_root().join("content-cache")
 }
+pub fn thumbs_cache_path() -> PathBuf {
+    content_cache_path().join("thumbnails")
+}
+
+/// Must match the compaction rewrite, `json_patch('{}', ...)`: nested objects, not arrays.
+pub fn snapshot_json<T: serde::Serialize>(value: &T) -> Result<String, String> {
+    let mut json = serde_json::to_value(value).map_err(|e| e.to_string())?;
+    strip_nulls(&mut json);
+    serde_json::to_string(&json).map_err(|e| e.to_string())
+}
+
+fn strip_nulls(value: &mut serde_json::Value) {
+    if let serde_json::Value::Object(map) = value {
+        map.retain(|_, member| !member.is_null());
+        map.values_mut().for_each(strip_nulls);
+    }
+}
 
 pub fn sanitize_cache_key(value: &str) -> String {
     value
@@ -286,10 +321,12 @@ pub fn open_database() -> Result<Connection, String> {
 
 pub fn prepare_connection(connection: &mut Connection) -> Result<(), String> {
     connection
-        .busy_timeout(Duration::from_secs(5))
+        .busy_timeout(Duration::from_secs(30))
         .map_err(|e| e.to_string())?;
     connection
-        .execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;")
+        // auto_vacuum only applies to new databases or after a VACUUM. The long busy
+        // timeout lets writes wait out the background compaction.
+        .execute_batch("PRAGMA auto_vacuum=INCREMENTAL; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=30000; PRAGMA journal_size_limit=67108864;")
         .map_err(|e| e.to_string())?;
     initialize_schema(connection)
 }
@@ -381,6 +418,29 @@ pub fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
                     let _ = std::fs::remove_dir_all(&legacy);
                 }
             }
+            5 => {
+                transaction
+                    .execute_batch(
+                        "CREATE TABLE IF NOT EXISTS thumb_blobs (
+                            content_key TEXT PRIMARY KEY,
+                            size INTEGER NOT NULL,
+                            relative_path TEXT NOT NULL UNIQUE,
+                            last_access_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                        );
+                        CREATE TABLE IF NOT EXISTS thumb_refs (
+                            service TEXT NOT NULL,
+                            creator_id TEXT NOT NULL,
+                            post_id TEXT NOT NULL,
+                            media_id TEXT NOT NULL,
+                            content_key TEXT NOT NULL REFERENCES thumb_blobs(content_key) ON DELETE CASCADE,
+                            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            PRIMARY KEY (service, creator_id, post_id, media_id)
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_thumb_refs_key ON thumb_refs(content_key);
+                        CREATE INDEX IF NOT EXISTS idx_thumb_refs_post ON thumb_refs(service, creator_id, post_id);",
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
             _ => return Err(format!("Missing database migration {next_version}")),
         }
         transaction
@@ -432,5 +492,7 @@ mod tests {
         assert!(column_exists(&connection, "creators", "updated_at").unwrap());
         assert!(column_exists(&connection, "creators", "indexed_at").unwrap());
         assert!(column_exists(&connection, "creators", "is_ai").unwrap());
+        assert!(column_exists(&connection, "thumb_blobs", "content_key").unwrap());
+        assert!(column_exists(&connection, "thumb_refs", "content_key").unwrap());
     }
 }

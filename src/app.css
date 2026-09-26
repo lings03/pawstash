@@ -91,8 +91,7 @@
 .os-scrollbar .os-scrollbar-handle {
   border-radius: var(--os-handle-border-radius);
   transition: background-color var(--duration-fast, 120ms) ease,
-              opacity 160ms ease,
-              transform var(--duration-fast, 120ms) ease;
+              opacity 160ms ease;
 }
 
 .select-dropdown-portal,
@@ -956,6 +955,12 @@ select:focus-visible,
   outline-offset: -3px;
   border-radius: inherit;
 }
+
+.download-progress { position: absolute; z-index: 7; inset: auto 0 0; height: calc(3px * var(--grid-scale, 1)); overflow: hidden; background: rgba(var(--surface-tint-rgb), .16); pointer-events: none; }
+.download-progress > span { display: block; height: 100%; background: var(--accent-primary); transition: width 220ms var(--ease-expo); }
+.download-progress.indeterminate::after { position: absolute; inset: 0; width: 35%; content: ''; background: var(--accent-primary); animation: download-progress-indeterminate 1.2s ease-in-out infinite; }
+@keyframes download-progress-indeterminate { from { transform: translateX(-110%); } to { transform: translateX(330%); } }
+@media (prefers-reduced-motion: reduce) { .download-progress.indeterminate::after { animation: none; width: 100%; opacity: .45; } }
 
 .grid-tile-placeholder {
   position: absolute;
@@ -2119,4 +2124,9 @@ video.grid-tile-media::-webkit-media-controls-enclosure {
   left: -9.5px;
   transform: translateY(-50%) rotate(90deg);
   filter: drop-shadow(-2px 0 2px rgba(0, 0, 0, 0.4));
+}
+
+html.opaque-window,
+html.opaque-window body {
+  background-color: var(--bg-base) !important;
 }

@@ -1,4 +1,5 @@
 use crate::config::settings::AppSettings;
+use crate::downloader::template::sanitize_path_segment;
 use std::path::Path;
 
 pub struct PostMetadataExport<'a> {
@@ -12,6 +13,7 @@ pub struct PostMetadataExport<'a> {
     pub tags: Option<&'a [String]>,
     pub origin_url: Option<String>,
     pub source_url: Option<String>,
+    pub raw_json: Option<&'a str>,
 }
 
 pub fn save_post_metadata(
@@ -27,13 +29,29 @@ pub fn save_post_metadata(
     let write_txt = format == "txt" || format == "both";
     let write_json = format == "json" || format == "both";
 
+    let (txt_filename, json_filename) = if settings.download_group_by_post {
+        ("info.txt".to_string(), "post.json".to_string())
+    } else {
+        let title = metadata.post_title.trim();
+        let stem = if title.is_empty() {
+            sanitize_path_segment(metadata.post_id, 80)
+        } else {
+            format!(
+                "{} [{}]",
+                sanitize_path_segment(title, 80),
+                sanitize_path_segment(metadata.post_id, 40)
+            )
+        };
+        (format!("{stem}.info.txt"), format!("{stem}.json"))
+    };
+
     let resolved_source_url = metadata
         .source_url
         .as_deref()
         .or(metadata.origin_url.as_deref());
 
     if write_txt {
-        let txt_path = target_dir.join("info.txt");
+        let txt_path = target_dir.join(&txt_filename);
         if !txt_path.exists() {
             let mut lines = Vec::new();
             if !metadata.post_title.is_empty() {
@@ -78,24 +96,38 @@ pub fn save_post_metadata(
     }
 
     if write_json {
-        let json_path = target_dir.join("post.json");
+        let json_path = target_dir.join(&json_filename);
         if !json_path.exists() {
-            let mut json_value = serde_json::json!({
-                "service": metadata.service,
-                "creator_id": metadata.creator_id,
-                "creator_name": metadata.creator_name,
-                "post_id": metadata.post_id,
-                "title": metadata.post_title,
-                "published": metadata.published,
-                "content": metadata.content,
-                "tags": metadata.tags,
-            });
-            if let Some(source_url) = resolved_source_url {
-                json_value["source_url"] = serde_json::Value::String(source_url.to_string());
-            }
-            if let Ok(json_str) = serde_json::to_string_pretty(&json_value) {
-                let _ = std::fs::write(&json_path, json_str);
-            }
+            let json_str = if let Some(raw) = metadata.raw_json {
+                if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(raw) {
+                    if let Some(source_url) = resolved_source_url {
+                        val["source_url"] = serde_json::Value::String(source_url.to_string());
+                    }
+                    if !metadata.creator_name.is_empty() && val.get("creator_name").is_none() {
+                        val["creator_name"] =
+                            serde_json::Value::String(metadata.creator_name.to_string());
+                    }
+                    serde_json::to_string_pretty(&val).unwrap_or_else(|_| raw.to_string())
+                } else {
+                    raw.to_string()
+                }
+            } else {
+                let mut json_value = serde_json::json!({
+                    "service": metadata.service,
+                    "creator_id": metadata.creator_id,
+                    "creator_name": metadata.creator_name,
+                    "post_id": metadata.post_id,
+                    "title": metadata.post_title,
+                    "published": metadata.published,
+                    "content": metadata.content,
+                    "tags": metadata.tags,
+                });
+                if let Some(source_url) = resolved_source_url {
+                    json_value["source_url"] = serde_json::Value::String(source_url.to_string());
+                }
+                serde_json::to_string_pretty(&json_value).unwrap_or_default()
+            };
+            let _ = std::fs::write(&json_path, json_str);
         }
     }
 
@@ -134,6 +166,7 @@ mod tests {
         let mut settings = AppSettings {
             download_save_metadata: true,
             download_metadata_format: "both".to_string(),
+            download_group_by_post: true,
             ..Default::default()
         };
         settings.normalize();
@@ -157,6 +190,7 @@ mod tests {
             tags: None,
             origin_url: None,
             source_url: Some(source_url.clone()),
+            raw_json: None,
         };
         save_post_metadata(&temp_dir, &meta_oh, &settings).unwrap();
 
@@ -165,6 +199,19 @@ mod tests {
 
         let json_str = std::fs::read_to_string(temp_dir.join("post.json")).unwrap();
         assert!(json_str.contains(&source_url));
+
+        let mut flat_settings = settings.clone();
+        flat_settings.download_group_by_post = false;
+        save_post_metadata(&temp_dir, &meta_oh, &flat_settings).unwrap();
+        assert!(temp_dir.join("Test Post [post123].info.txt").exists());
+        assert!(temp_dir.join("Test Post [post123].json").exists());
+
+        let same_title = PostMetadataExport {
+            post_id: "post456",
+            ..meta_oh
+        };
+        save_post_metadata(&temp_dir, &same_title, &flat_settings).unwrap();
+        assert!(temp_dir.join("Test Post [post456].info.txt").exists());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

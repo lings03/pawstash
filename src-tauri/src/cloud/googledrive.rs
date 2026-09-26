@@ -60,12 +60,7 @@ pub async fn resolve_googledrive(
     let mut size = None;
 
     let view_url = format!("https://drive.google.com/file/d/{target_id}/view");
-    if let Ok(resp) = client
-        .get(&view_url)
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        .send()
-        .await
-    {
+    if let Ok(resp) = client.get(&view_url).send().await {
         if let Ok(html) = resp.text().await {
             if let Some(og_title) = extract_meta_content(&html, "og:title") {
                 let trimmed = og_title.trim();
@@ -86,10 +81,7 @@ pub async fn resolve_googledrive(
     }
 
     if size.is_none() {
-        let direct_req = client.get(&direct_url).header(
-            "User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        );
+        let direct_req = client.get(&direct_url);
         if let Ok(resp) = direct_req.send().await {
             let ct = resp
                 .headers()
@@ -135,10 +127,7 @@ pub async fn resolve_googledrive(
                         let confirmed_url = format!(
                             "https://drive.usercontent.google.com/download?id={target_id}&export=download&confirm=t&uuid={uuid}"
                         );
-                        let mut head_req = client.head(&confirmed_url).header(
-                            "User-Agent",
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                        );
+                        let mut head_req = client.head(&confirmed_url);
                         if let Some(cookie_hdr) = upstream_headers.get(reqwest::header::SET_COOKIE)
                         {
                             if let Ok(cookie_str) = cookie_hdr.to_str() {

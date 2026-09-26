@@ -1,10 +1,13 @@
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { DownloadItem } from '$lib/types/download';
+import { isAutoRetryPending, isFailedDownload, type DownloadItem } from '$lib/types/download';
 import {
+  apiCancelAllDownloads,
   apiCancelDownload,
   apiListDownloads,
+  apiPauseAllDownloads,
   apiPauseDownload,
   apiRemoveDownload,
+  apiResumeAllDownloads,
   apiResumeDownload,
   apiRetryDownload,
   apiStartDownload,
@@ -15,9 +18,23 @@ import type { Post } from '$lib/types/content';
 import { getPostDownloadTargets } from '$lib/utils/media';
 import { contentState, postCacheKey } from '$lib/state/contentState.svelte';
 import { serverPortState } from '$lib/state/serverPort.svelte';
+import { configState } from '$lib/state/configState.svelte';
 import { logger } from '$lib/utils/logger';
 
-export type DownloadFilter = 'active' | 'completed' | 'all';
+export type DownloadFilter = 'active' | 'completed' | 'failed' | 'all';
+
+const IN_FLIGHT_STATUSES = ['queued', 'resolving', 'downloading', 'paused', 'verifying'];
+const isInFlight = (item: DownloadItem) => IN_FLIGHT_STATUSES.includes(item.status) || isAutoRetryPending(item);
+
+export interface QueueStats {
+  downloading: number;
+  queued: number;
+  paused: number;
+  failed: number;
+  downloadedBytes: number;
+  totalBytes: number;
+  speedBps: number;
+}
 
 export class DownloadState {
   downloads = $state<DownloadItem[]>([]);
@@ -27,27 +44,31 @@ export class DownloadState {
   private initPromise: Promise<void> | null = null;
   private unlisten: UnlistenFn | null = null;
 
-  activeDownloadsCount = $derived(
-    this.downloads.filter((item) =>
-      ['queued', 'resolving', 'downloading', 'paused', 'verifying'].includes(item.status)
-    ).length
-  );
+  activeDownloadsCount = $derived(this.downloads.filter(isInFlight).length);
 
-  activeProgress = $derived.by<number | null>(() => {
-    const running = this.downloads.filter((item) =>
-      ['queued', 'resolving', 'downloading', 'paused', 'verifying'].includes(item.status)
-    );
-    if (!running.length) return null;
-    let done = 0;
-    let total = 0;
-    for (const item of running) {
+  failedDownloadsCount = $derived(this.downloads.filter(isFailedDownload).length);
+
+  queueStats = $derived.by<QueueStats>(() => {
+    const stats: QueueStats = { downloading: 0, queued: 0, paused: 0, failed: 0, downloadedBytes: 0, totalBytes: 0, speedBps: 0 };
+    for (const item of this.downloads) {
+      if (isFailedDownload(item)) stats.failed++;
+      if (!isInFlight(item)) continue;
+      if (item.status === 'paused') stats.paused++;
+      else if (item.status === 'queued' || isAutoRetryPending(item)) stats.queued++;
+      else stats.downloading++;
+      stats.speedBps += item.speed_bps;
       if (item.total_bytes > 0) {
-        done += Math.min(item.downloaded_bytes, item.total_bytes);
-        total += item.total_bytes;
+        stats.downloadedBytes += Math.min(item.downloaded_bytes, item.total_bytes);
+        stats.totalBytes += item.total_bytes;
       }
     }
-    if (total <= 0) return null;
-    return Math.min(1, Math.max(0, done / total));
+    return stats;
+  });
+
+  activeProgress = $derived.by<number | null>(() => {
+    const { downloadedBytes, totalBytes } = this.queueStats;
+    if (this.activeDownloadsCount === 0 || totalBytes <= 0) return null;
+    return Math.min(1, Math.max(0, downloadedBytes / totalBytes));
   });
 
   activeIsIndeterminate = $derived(
@@ -60,6 +81,9 @@ export class DownloadState {
     }
     if (this.filter === 'active') {
       return this.downloads.filter((item) => item.status !== 'completed');
+    }
+    if (this.filter === 'failed') {
+      return this.downloads.filter(isFailedDownload);
     }
     return this.downloads;
   });
@@ -134,6 +158,24 @@ export class DownloadState {
     this.upsert(await apiRetryDownload(id));
   }
 
+  async pauseAll() {
+    await apiPauseAllDownloads();
+  }
+
+  async resumeAll() {
+    await apiResumeAllDownloads();
+  }
+
+  async cancelAll() {
+    await apiCancelAllDownloads();
+  }
+
+  async retryFailed() {
+    for (const item of this.downloads.filter(isFailedDownload)) {
+      await this.retry(item.id);
+    }
+  }
+
   async cancel(id: string) {
     this.upsert(await apiCancelDownload(id));
   }
@@ -180,7 +222,7 @@ export class DownloadState {
       count++;
     }
 
-    const cloudLinks = fullPost.cloud_urls || [];
+    const cloudLinks = configState.settings.cloud_scraping_enabled === false ? [] : fullPost.cloud_urls || [];
     if (cloudLinks.length > 0) {
       await serverPortState.ensurePort();
       const port = serverPortState.port || 0;

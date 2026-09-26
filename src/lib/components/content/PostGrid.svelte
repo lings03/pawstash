@@ -143,8 +143,9 @@
       }
     }
     if (viewport && hasMore && !loading) {
-      const scrollBottom = viewport.scrollTop + viewport.clientHeight;
-      if (scrollBottom >= viewport.scrollHeight - 1200) {
+      const scrollBottom = viewport.scrollTop + (viewportHeight || viewport.clientHeight);
+      const totalHeight = virtualHeight > 0 ? virtualHeight : (viewport.scrollHeight || 0);
+      if (scrollBottom >= totalHeight - 1200) {
         requestMore();
       }
     }
@@ -220,8 +221,9 @@
 
   $effect(() => {
     if (posts.length > 0 && hasMore && !loading && viewport) {
-      const scrollBottom = viewport.scrollTop + viewport.clientHeight;
-      if (scrollBottom >= viewport.scrollHeight - 600) {
+      const scrollBottom = viewport.scrollTop + (viewportHeight || viewport.clientHeight);
+      const totalHeight = virtualHeight > 0 ? virtualHeight : (viewport.scrollHeight || 0);
+      if (scrollBottom >= totalHeight - 600) {
         requestMore();
       }
     }

@@ -9,6 +9,14 @@ export type DownloadStatus =
   | 'cancelled'
   | 'missing';
 
+export const AUTO_RETRY_CODE = 'auto_retry';
+
+export const isAutoRetryPending = (item: Pick<DownloadItem, 'status' | 'error_code'>) =>
+  item.status === 'failed' && item.error_code === AUTO_RETRY_CODE;
+
+export const isFailedDownload = (item: Pick<DownloadItem, 'status' | 'error_code'>) =>
+  item.status === 'failed' && item.error_code !== AUTO_RETRY_CODE;
+
 export interface DownloadItem {
   id: string;
   service: string;

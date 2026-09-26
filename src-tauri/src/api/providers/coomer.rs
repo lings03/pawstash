@@ -11,7 +11,7 @@ use reqwest::{Client, Url};
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub struct CoomerProvider {
     id: String,
@@ -110,11 +110,18 @@ impl CoomerProvider {
             services: Self::default_services(),
             is_custom: false,
             priority: 2,
+            advanced_network: false,
+            user_agent: String::new(),
+            timeout_secs: 0,
+            proxy_url: String::new(),
+            max_retries: 0,
+            min_interval_ms: 0,
         }
     }
 
     pub fn new(config: ProviderConfig) -> Result<Self, String> {
-        Self::with_queue_config(config, Self::default_queue_config())
+        let queue_config = config.apply_queue_overrides(Self::default_queue_config());
+        Self::with_queue_config(config, queue_config)
     }
 
     pub fn with_queue_config(
@@ -187,7 +194,8 @@ impl CoomerProvider {
         let mut headers = HeaderMap::new();
         headers.insert(
             USER_AGENT,
-            HeaderValue::from_static(crate::downloader::PAWSTASH_USER_AGENT),
+            HeaderValue::from_str(&config.effective_user_agent())
+                .unwrap_or_else(|_| HeaderValue::from_static(crate::net::DEFAULT_API_USER_AGENT)),
         );
         headers.insert(ACCEPT, HeaderValue::from_static("text/css"));
         let cookie_raw = config.session_cookie.trim();
@@ -206,8 +214,9 @@ impl CoomerProvider {
 
     fn build_client(config: &ProviderConfig) -> Result<Client, String> {
         let headers = Self::build_headers(config);
-        crate::net::builder()
-            .timeout(Duration::from_secs(30))
+        config
+            .network_builder()
+            .timeout(config.effective_timeout())
             .gzip(true)
             .default_headers(headers)
             .build()
@@ -1067,6 +1076,7 @@ mod tests {
             services: vec!["onlyfans".into(), "fansly".into()],
             is_custom: false,
             priority: 2,
+            ..Default::default()
         }
     }
 
@@ -1156,6 +1166,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits live provider APIs; run with `cargo test -- --ignored`"]
     async fn live_coomer_public_contracts() {
         let conf = ProviderConfig {
             id: "coomer".into(),
@@ -1172,6 +1183,7 @@ mod tests {
             services: vec!["onlyfans".into(), "fansly".into()],
             is_custom: false,
             priority: 2,
+            ..Default::default()
         };
         let provider = CoomerProvider::new(conf).expect("create CoomerProvider");
 

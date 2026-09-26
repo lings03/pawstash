@@ -870,6 +870,7 @@ mod tests {
                 services: vec!["patreon".into(), "fanbox".into()],
                 is_custom: true,
                 priority: 0,
+                ..Default::default()
             },
             {
                 let mut config = crate::api::providers::OnlyHavenProvider::default_config();

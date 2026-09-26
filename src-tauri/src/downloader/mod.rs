@@ -122,17 +122,15 @@ pub fn derive_download_cookie(url: &str, session_cookie: &str) -> Option<String>
     }
 }
 
-pub const PAWSTASH_USER_AGENT: &str =
-    concat!("Github:Pawstash/Pawstash;v=", env!("CARGO_PKG_VERSION"));
+pub use crate::net::DEFAULT_API_USER_AGENT as PAWSTASH_USER_AGENT;
 
 pub fn standard_browser_headers() -> reqwest::header::HeaderMap {
     use reqwest::header::*;
     let mut map = HeaderMap::new();
     map.insert(
         USER_AGENT,
-        HeaderValue::from_static(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-        ),
+        HeaderValue::from_str(&crate::net::browser_user_agent())
+            .unwrap_or_else(|_| HeaderValue::from_static(crate::net::DEFAULT_BROWSER_USER_AGENT)),
     );
     map.insert(ACCEPT, HeaderValue::from_static("*/*"));
     map.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
@@ -167,7 +165,7 @@ pub fn standard_browser_headers() -> reqwest::header::HeaderMap {
 
 pub fn standard_browser_header_args() -> Vec<String> {
     vec![
-        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36".into(),
+        format!("--user-agent={}", crate::net::browser_user_agent()),
         "--header=Accept: */*".into(),
         "--header=Accept-Language: en-US,en;q=0.9".into(),
         "--header=sec-ch-ua: \"Not(A:Brand\";v=\"99\", \"Google Chrome\";v=\"133\", \"Chromium\";v=\"133\"".into(),
@@ -183,7 +181,11 @@ pub fn derive_download_headers(url: &str) -> reqwest::header::HeaderMap {
     use reqwest::header::*;
     if crate::api::providers::uses_app_user_agent(url) {
         let mut map = HeaderMap::new();
-        map.insert(USER_AGENT, HeaderValue::from_static(PAWSTASH_USER_AGENT));
+        map.insert(
+            USER_AGENT,
+            HeaderValue::from_str(&crate::net::api_user_agent())
+                .unwrap_or_else(|_| HeaderValue::from_static(PAWSTASH_USER_AGENT)),
+        );
         map.insert(ACCEPT, HeaderValue::from_static("*/*"));
         map.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
         map
@@ -195,7 +197,7 @@ pub fn derive_download_headers(url: &str) -> reqwest::header::HeaderMap {
 pub fn derive_download_header_args(url: &str) -> Vec<String> {
     if crate::api::providers::uses_app_user_agent(url) {
         vec![
-            format!("--user-agent={PAWSTASH_USER_AGENT}"),
+            format!("--user-agent={}", crate::net::api_user_agent()),
             "--header=Accept: */*".into(),
             "--header=Accept-Language: en-US,en;q=0.9".into(),
         ]
@@ -266,7 +268,7 @@ mod tests {
         let headers = standard_browser_headers();
         assert_eq!(
             headers.get("user-agent").and_then(|v| v.to_str().ok()),
-            Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36")
+            Some(crate::net::DEFAULT_BROWSER_USER_AGENT)
         );
         assert_eq!(
             headers

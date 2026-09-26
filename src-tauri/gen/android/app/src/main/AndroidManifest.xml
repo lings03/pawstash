@@ -69,8 +69,8 @@
                 <data android:scheme="pawstash" />
             </intent-filter>
 
-            <!-- HTTP/HTTPS App Links -->
-            <intent-filter>
+            <!-- Opens without a chooser only once the domain serves assetlinks.json for this app. -->
+            <intent-filter android:autoVerify="true">
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
@@ -84,6 +84,8 @@
                 <data android:host="www.pawchive.net" />
                 <data android:host="cum.st" />
                 <data android:host="www.cum.st" />
+                <data android:host="coomer.st" />
+                <data android:host="www.coomer.st" />
             </intent-filter>
 
             <!-- Share Target -->

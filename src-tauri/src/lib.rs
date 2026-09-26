@@ -10,6 +10,8 @@ pub mod server;
 pub mod smart_links;
 pub mod subscriptions;
 pub mod sync;
+pub mod webview_proxy;
+pub mod window_setup;
 
 use api::pawchive::PawchiveClient;
 use api::provider_manager::ProviderManager;
@@ -31,8 +33,13 @@ use tauri::{Emitter, Listener, Manager};
 
 #[cfg(target_os = "linux")]
 fn setup_platform() {
-    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
-        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    // Disabling DMA-BUF drops WebKitGTK's accelerated path. Only NVIDIA's explicit
+    // sync breaks on Wayland, so only that is turned off.
+    if std::env::var_os("__NV_DISABLE_EXPLICIT_SYNC").is_none()
+        && (std::path::Path::new("/proc/driver/nvidia").exists()
+            || std::path::Path::new("/sys/module/nvidia").exists())
+    {
+        std::env::set_var("__NV_DISABLE_EXPLICIT_SYNC", "1");
     }
 }
 
@@ -46,6 +53,12 @@ pub fn run() {
     logging::init_logging();
     let config_mgr = ConfigManager::new().expect("Failed to initialize SQLite settings");
     let settings = config_mgr.load().expect("Failed to load settings");
+    net::apply_settings(&settings);
+
+    let mut context = tauri::generate_context!();
+    if let Some(listener) = window_setup::apply(context.config_mut(), &settings) {
+        tauri::async_runtime::spawn(webview_proxy::serve(listener));
+    }
 
     let content = Arc::new(
         ContentRepository::new(settings.cache_max_mb)
@@ -64,6 +77,7 @@ pub fn run() {
     let download_manager = Arc::new(DownloadManager::new(
         download_repository,
         config_manager.clone(),
+        Some(content.clone()),
     ));
     let subscription_repository = Arc::new(
         SubscriptionRepository::new().expect("Failed to initialize creator subscriptions"),
@@ -218,12 +232,14 @@ pub fn run() {
                 sync_manager: sync_manager.clone(),
                 config_manager: config_manager.clone(),
             });
+            db::compaction::spawn(app.handle().clone());
 
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_system_accent_color,
             get_pending_deep_link,
+            set_app_hidden,
             open_app_links_settings,
             get_axum_port,
             check_aria2c_installed,
@@ -231,6 +247,10 @@ pub fn run() {
             probe_download_sizes,
             get_settings,
             get_default_settings,
+            get_network_defaults,
+            get_provider_network_defaults,
+            get_webview_proxy_status,
+            restart_app,
             get_cache_stats,
             clear_content_cache,
             clear_all_content_cache,
@@ -262,7 +282,6 @@ pub fn run() {
             list_creator_names,
             get_creator_name,
             sync_creators,
-            fetch_posts,
             fetch_recent_posts,
             fetch_popular_posts,
             fetch_creator_posts,
@@ -344,6 +363,7 @@ pub fn run() {
             commands::updater::check_for_updates,
             commands::updater::download_and_install_update,
             commands::window_effects::set_window_effect,
+            commands::window_effects::set_window_background_color,
             show_main_window,
             hide_to_tray,
             update_panic_key,
@@ -355,7 +375,7 @@ pub fn run() {
             clear_logs,
             resolve_deep_link
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }
 

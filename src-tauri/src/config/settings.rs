@@ -79,6 +79,10 @@ pub struct AppSettings {
     pub download_save_metadata: bool,
     pub download_metadata_format: String,
     pub download_max_concurrent: u32,
+    #[serde(default = "default_true")]
+    pub download_auto_retry: bool,
+    #[serde(default = "default_download_auto_retry_max")]
+    pub download_auto_retry_max: u32,
     pub panic_button_enabled: bool,
     pub panic_button_shortcut: String,
     pub providers: Vec<crate::api::provider::ProviderConfig>,
@@ -99,6 +103,31 @@ pub struct AppSettings {
     pub notifications_show_preview: bool,
     #[serde(default)]
     pub notifications_sound: bool,
+    // Empty or 0 means the built-in default, shown as a placeholder.
+    #[serde(default)]
+    pub network_api_user_agent: String,
+    #[serde(default)]
+    pub network_browser_user_agent: String,
+    #[serde(default)]
+    pub network_timeout_secs: u64,
+    #[serde(default)]
+    pub network_connect_timeout_secs: u64,
+    #[serde(default)]
+    pub provider_deadline_secs: u64,
+    #[serde(default = "default_window_background_color")]
+    pub window_background_color: String,
+    #[serde(default)]
+    pub linux_transparent_window: bool,
+    #[serde(default)]
+    pub cloud_timeout_secs: u64,
+    #[serde(default)]
+    pub cloud_max_redirects: u64,
+    #[serde(default = "default_true")]
+    pub cloud_scraping_enabled: bool,
+    #[serde(default)]
+    pub cloud_user_agent: String,
+    #[serde(default)]
+    pub cloud_proxy_url: String,
 }
 
 fn default_true() -> bool {
@@ -107,6 +136,23 @@ fn default_true() -> bool {
 
 fn default_notifications_enabled() -> bool {
     cfg!(target_os = "android")
+}
+
+fn default_download_auto_retry_max() -> u32 {
+    3
+}
+
+fn default_window_background_color() -> String {
+    "#0c0e14".to_string()
+}
+
+/// Forced opaque: a translucent clear colour on an opaque window renders as garbage.
+pub fn parse_window_background_color(value: &str) -> Option<tauri::utils::config::Color> {
+    value
+        .trim()
+        .parse::<tauri::utils::config::Color>()
+        .ok()
+        .map(|color| tauri::utils::config::Color(color.0, color.1, color.2, 255))
 }
 
 fn default_card_view_mode() -> String {
@@ -193,6 +239,8 @@ impl Default for AppSettings {
             download_save_metadata: false,
             download_metadata_format: "txt".to_string(),
             download_max_concurrent: 3,
+            download_auto_retry: true,
+            download_auto_retry_max: default_download_auto_retry_max(),
             panic_button_enabled: true,
             panic_button_shortcut: "H".to_string(),
             providers: crate::api::provider_manager::ProviderManager::default_configs(),
@@ -206,6 +254,18 @@ impl Default for AppSettings {
             notifications_download_progress: true,
             notifications_show_preview: true,
             notifications_sound: false,
+            network_api_user_agent: String::new(),
+            network_browser_user_agent: String::new(),
+            network_timeout_secs: 0,
+            network_connect_timeout_secs: 0,
+            provider_deadline_secs: 0,
+            window_background_color: default_window_background_color(),
+            linux_transparent_window: false,
+            cloud_timeout_secs: 0,
+            cloud_max_redirects: 0,
+            cloud_scraping_enabled: true,
+            cloud_user_agent: String::new(),
+            cloud_proxy_url: String::new(),
         }
     }
 }
@@ -273,10 +333,20 @@ impl ConfigManager {
         settings.proxy_password = Self::load_secret_string(PROXY_PASSWORD_SECRET)?;
         let migrated_plaintext_secret = Self::hydrate_provider_secrets(&mut settings)?;
         let providers_before_normalize = settings.providers.clone();
+        let renamed_provider_ids = settings.migrate_legacy_provider_ids();
         settings.normalize();
 
         if migrated_plaintext_secret || settings.providers != providers_before_normalize {
             self.save(&settings)?;
+            // Otherwise the old secret loads into whichever provider gets the old id.
+            for old_id in &renamed_provider_ids {
+                let still_owned = settings.providers.iter().any(|p| {
+                    p.id.eq_ignore_ascii_case(old_id) && !p.session_cookie.trim().is_empty()
+                });
+                if !still_owned {
+                    SecretStore::delete_named(&Self::provider_secret_name(old_id))?;
+                }
+            }
             return Ok(settings);
         }
 
@@ -327,6 +397,25 @@ impl ConfigManager {
             *guard = Some(settings.clone());
         }
 
+        Ok(())
+    }
+
+    /// Own row, so a concurrent full save can't clobber it.
+    pub fn save_window_background_color(&self, color: &str) -> Result<(), String> {
+        {
+            let conn = self.conn.lock().map_err(|e| e.to_string())?;
+            conn.execute(
+                "INSERT INTO app_settings (key, value, updated_at) VALUES (?1, ?2, CURRENT_TIMESTAMP)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP",
+                params![format!("{SETTINGS_PREFIX}window_background_color"), color],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if let Ok(mut guard) = self.cached.lock() {
+            if let Some(cached) = guard.as_mut() {
+                cached.window_background_color = color.to_string();
+            }
+        }
         Ok(())
     }
 
@@ -454,6 +543,38 @@ impl AppSettings {
             ("auto_check_updates", self.auto_check_updates.to_string()),
             ("include_prereleases", self.include_prereleases.to_string()),
             ("scroll_edge_mask", self.scroll_edge_mask.to_string()),
+            (
+                "network_api_user_agent",
+                self.network_api_user_agent.clone(),
+            ),
+            (
+                "network_browser_user_agent",
+                self.network_browser_user_agent.clone(),
+            ),
+            (
+                "network_timeout_secs",
+                self.network_timeout_secs.to_string(),
+            ),
+            (
+                "network_connect_timeout_secs",
+                self.network_connect_timeout_secs.to_string(),
+            ),
+            (
+                "provider_deadline_secs",
+                self.provider_deadline_secs.to_string(),
+            ),
+            (
+                "linux_transparent_window",
+                self.linux_transparent_window.to_string(),
+            ),
+            ("cloud_timeout_secs", self.cloud_timeout_secs.to_string()),
+            ("cloud_max_redirects", self.cloud_max_redirects.to_string()),
+            (
+                "cloud_scraping_enabled",
+                self.cloud_scraping_enabled.to_string(),
+            ),
+            ("cloud_user_agent", self.cloud_user_agent.clone()),
+            ("cloud_proxy_url", self.cloud_proxy_url.clone()),
             ("titlebar_style", self.titlebar_style.clone()),
             (
                 "download_group_by_creator",
@@ -486,6 +607,11 @@ impl AppSettings {
             (
                 "download_max_concurrent",
                 self.download_max_concurrent.to_string(),
+            ),
+            ("download_auto_retry", self.download_auto_retry.to_string()),
+            (
+                "download_auto_retry_max",
+                self.download_auto_retry_max.to_string(),
             ),
             (
                 "panic_button_enabled",
@@ -551,6 +677,11 @@ impl AppSettings {
         string!(layout_mode);
         string!(toast_position);
         string!(titlebar_style);
+        string!(network_api_user_agent);
+        string!(network_browser_user_agent);
+        string!(window_background_color);
+        string!(cloud_user_agent);
+        string!(cloud_proxy_url);
         string!(download_creator_folder_template);
         string!(download_post_folder_template);
         string!(download_filename_template);
@@ -605,6 +736,12 @@ impl AppSettings {
         if let Some(value) = get("download_max_concurrent").and_then(|v| v.parse().ok()) {
             self.download_max_concurrent = value;
         }
+        if let Some(value) = get("download_auto_retry").and_then(|v| v.parse().ok()) {
+            self.download_auto_retry = value;
+        }
+        if let Some(value) = get("download_auto_retry_max").and_then(|v| v.parse().ok()) {
+            self.download_auto_retry_max = value;
+        }
         if let Some(value) = get("panic_button_enabled")
             .or_else(|| get("boss_key_enabled"))
             .and_then(|v| v.parse().ok())
@@ -643,6 +780,27 @@ impl AppSettings {
         }
         if let Some(value) = get("scroll_edge_mask").and_then(|v| v.parse().ok()) {
             self.scroll_edge_mask = value;
+        }
+        if let Some(value) = get("network_timeout_secs").and_then(|v| v.parse().ok()) {
+            self.network_timeout_secs = value;
+        }
+        if let Some(value) = get("network_connect_timeout_secs").and_then(|v| v.parse().ok()) {
+            self.network_connect_timeout_secs = value;
+        }
+        if let Some(value) = get("provider_deadline_secs").and_then(|v| v.parse().ok()) {
+            self.provider_deadline_secs = value;
+        }
+        if let Some(value) = get("linux_transparent_window").and_then(|v| v.parse().ok()) {
+            self.linux_transparent_window = value;
+        }
+        if let Some(value) = get("cloud_timeout_secs").and_then(|v| v.parse().ok()) {
+            self.cloud_timeout_secs = value;
+        }
+        if let Some(value) = get("cloud_max_redirects").and_then(|v| v.parse().ok()) {
+            self.cloud_max_redirects = value;
+        }
+        if let Some(value) = get("cloud_scraping_enabled").and_then(|v| v.parse().ok()) {
+            self.cloud_scraping_enabled = value;
         }
         if let Some(value) = get("cache_max_mb").and_then(|v| v.parse().ok()) {
             self.cache_max_mb = value;
@@ -686,6 +844,7 @@ impl AppSettings {
         self.cache_max_mb = self.cache_max_mb.clamp(64, 2048);
         self.grid_scale = self.grid_scale.clamp(60, 160);
         self.download_max_concurrent = self.download_max_concurrent.clamp(1, 10);
+        self.download_auto_retry_max = self.download_auto_retry_max.clamp(1, 10);
         if !matches!(self.layout_mode.as_str(), "auto" | "mobile" | "desktop") {
             self.layout_mode = "auto".to_string();
         }
@@ -707,10 +866,40 @@ impl AppSettings {
         if !matches!(self.card_view_mode.as_str(), "detailed" | "compact") {
             self.card_view_mode = "detailed".to_string();
         }
+        if self.network_timeout_secs != 0 {
+            self.network_timeout_secs = self.network_timeout_secs.clamp(5, 600);
+        }
+        if self.network_connect_timeout_secs != 0 {
+            self.network_connect_timeout_secs = self.network_connect_timeout_secs.clamp(1, 120);
+        }
+        if self.provider_deadline_secs != 0 {
+            self.provider_deadline_secs = self.provider_deadline_secs.clamp(1, 120);
+        }
+        if self.cloud_timeout_secs != 0 {
+            self.cloud_timeout_secs = self.cloud_timeout_secs.clamp(5, 600);
+        }
+        if self.cloud_max_redirects != 0 {
+            self.cloud_max_redirects = self.cloud_max_redirects.clamp(1, 30);
+        }
+        if parse_window_background_color(&self.window_background_color).is_none() {
+            self.window_background_color = default_window_background_color();
+        }
         if self.providers.is_empty() {
             self.providers = crate::api::provider_manager::ProviderManager::default_configs();
         }
+        self.migrate_legacy_provider_ids();
         let default_configs = crate::api::provider_manager::ProviderManager::default_configs();
+        for p in &mut self.providers {
+            if p.timeout_secs != 0 {
+                p.timeout_secs = p.timeout_secs.clamp(5, 600);
+            }
+            if p.max_retries != 0 {
+                p.max_retries = p.max_retries.clamp(1, 10);
+            }
+            if p.min_interval_ms != 0 {
+                p.min_interval_ms = p.min_interval_ms.clamp(10, 5000);
+            }
+        }
         for p in &mut self.providers {
             if let Some(def) = default_configs
                 .iter()
@@ -783,6 +972,67 @@ impl AppSettings {
         }
     }
 
+    /// v26.8.3 to v26.8.12 saved OnlyHaven under `coomer`. Returns the renamed-away ids.
+    pub fn migrate_legacy_provider_ids(&mut self) -> Vec<String> {
+        let defaults = crate::api::provider_manager::ProviderManager::default_configs();
+        let mut renamed = Vec::new();
+        for provider in &mut self.providers {
+            if provider.is_custom {
+                continue;
+            }
+            let Some(host) = url_host(&provider.api_url) else {
+                continue;
+            };
+            let Some(def) = defaults.iter().find(|def| {
+                url_host(&def.api_url).is_some_and(|def_host| host_within(&host, &def_host))
+            }) else {
+                continue;
+            };
+            if provider.id.eq_ignore_ascii_case(&def.id) {
+                continue;
+            }
+            renamed.push(std::mem::replace(&mut provider.id, def.id.clone()));
+            provider.name = def.name.clone();
+            provider.services = def.services.clone();
+            provider.file_prefix = def.file_prefix.clone();
+            provider.image_prefix = def.image_prefix.clone();
+            let def_host = url_host(&def.api_url).unwrap_or_default();
+            let foreign = |url: &Option<String>| {
+                !url.as_deref()
+                    .and_then(url_host)
+                    .is_some_and(|h| host_within(&h, &def_host))
+            };
+            if foreign(&provider.file_url) {
+                provider.file_url = def.file_url.clone();
+            }
+            if foreign(&provider.image_url) {
+                provider.image_url = def.image_url.clone();
+            }
+        }
+
+        let mut kept: Vec<crate::api::provider::ProviderConfig> =
+            Vec::with_capacity(self.providers.len());
+        for provider in self.providers.drain(..) {
+            match kept
+                .iter_mut()
+                .find(|existing| existing.id.eq_ignore_ascii_case(&provider.id))
+            {
+                Some(existing) => {
+                    existing.enabled |= provider.enabled;
+                    if existing.session_cookie.trim().is_empty()
+                        && !provider.session_cookie.trim().is_empty()
+                    {
+                        existing.session_cookie = provider.session_cookie;
+                        existing.username = provider.username;
+                    }
+                }
+                None => kept.push(provider),
+            }
+        }
+        self.providers = kept;
+        renamed
+    }
+
     pub fn resolve_cookie_for_url(&self, url: &str) -> Option<String> {
         let parsed = reqwest::Url::parse(url).ok()?;
         let host = parsed.host_str()?.to_lowercase();
@@ -852,6 +1102,23 @@ impl AppSettings {
     }
 }
 
+fn url_host(value: &str) -> Option<String> {
+    let url = reqwest::Url::parse(value.trim()).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    Some(
+        host.strip_prefix("www.")
+            .map(str::to_string)
+            .unwrap_or(host),
+    )
+}
+
+fn host_within(host: &str, domain: &str) -> bool {
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
 fn normalized_origin(value: &str) -> String {
     value
         .trim()
@@ -870,6 +1137,74 @@ fn endpoint_is_missing_or_api_origin(endpoint: Option<&str>, api_url: &str) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_onlyhaven_saved_as_coomer_is_renamed_not_duplicated() {
+        use crate::api::providers::onlyhaven::OnlyHavenProvider;
+        let defaults = crate::api::provider_manager::ProviderManager::default_configs();
+        let legacy = crate::api::provider::ProviderConfig {
+            id: "coomer".to_string(),
+            name: "OnlyHaven".to_string(),
+            enabled: true,
+            api_url: "https://cum.st".to_string(),
+            file_prefix: Some("c1".to_string()),
+            services: vec!["onlyfans".into(), "fansly".into(), "candfans".into()],
+            session_cookie: "legacy-session".to_string(),
+            ..Default::default()
+        };
+        let mut settings = AppSettings {
+            providers: vec![defaults[0].clone(), legacy],
+            ..AppSettings::default()
+        };
+
+        let renamed = settings.migrate_legacy_provider_ids();
+        settings.normalize();
+
+        assert_eq!(renamed, vec!["coomer".to_string()]);
+        let onlyhaven: Vec<_> = settings
+            .providers
+            .iter()
+            .filter(|p| OnlyHavenProvider::matches_config(p))
+            .collect();
+        assert_eq!(onlyhaven.len(), 1);
+        assert_eq!(onlyhaven[0].id, "onlyhaven");
+        assert!(onlyhaven[0].enabled);
+        assert_eq!(onlyhaven[0].session_cookie, "legacy-session");
+        assert!(!onlyhaven[0].services.iter().any(|s| s == "candfans"));
+        assert_ne!(onlyhaven[0].file_prefix.as_deref(), Some("c1"));
+
+        let coomer: Vec<_> = settings
+            .providers
+            .iter()
+            .filter(|p| p.id == "coomer")
+            .collect();
+        assert_eq!(coomer.len(), 1);
+        assert_eq!(coomer[0].api_url, "https://coomer.st");
+        assert!(coomer[0].session_cookie.is_empty());
+        assert_eq!(
+            settings
+                .providers
+                .iter()
+                .filter(|p| p.name == "OnlyHaven")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn provider_mirrors_keep_their_ids() {
+        let mut coomer = crate::api::provider_manager::ProviderManager::default_configs()
+            .into_iter()
+            .find(|p| p.id == "coomer")
+            .unwrap();
+        coomer.api_url = "https://coomer.su".to_string();
+        let mut settings = AppSettings {
+            providers: vec![coomer],
+            ..AppSettings::default()
+        };
+        assert!(settings.migrate_legacy_provider_ids().is_empty());
+        assert_eq!(settings.providers[0].id, "coomer");
+    }
 
     #[test]
     fn missing_fields_use_defaults() {

@@ -1,11 +1,14 @@
 use crate::api::models::{Creator, CreatorProfile, Favorite, Post, PostRevision};
 #[cfg(test)]
 use crate::db::storage::prepare_connection;
-use crate::db::storage::{content_cache_path, open_database, sanitize_cache_key};
+use crate::db::storage::{
+    content_cache_path, open_database, sanitize_cache_key, thumbs_cache_path,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -102,6 +105,8 @@ impl ContentRepository {
         let files = scan_cache_files(&content_cache_path(), &protected)?;
         let mut stats = cache_stats_from_files(&files);
         stats.metadata_bytes = self.cached_metadata_bytes()?;
+        stats.total_bytes = stats.total_bytes.saturating_add(stats.metadata_bytes);
+        stats.reclaimable_bytes = stats.reclaimable_bytes.saturating_add(stats.metadata_bytes);
         Ok(stats)
     }
 
@@ -120,6 +125,23 @@ impl ContentRepository {
     }
 
     pub fn clear_cached_images(&self) -> Result<CacheStats, String> {
+        self.remove_cached_images()?;
+        self.compact();
+        self.cache_stats()
+    }
+
+    fn compact(&self) {
+        let Ok(connection) = self.connection.lock() else {
+            return;
+        };
+        if let Err(error) =
+            connection.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; PRAGMA optimize; VACUUM;")
+        {
+            tracing::warn!(%error, "Database compaction failed");
+        }
+    }
+
+    fn remove_cached_images(&self) -> Result<(), String> {
         let root = content_cache_path();
         let files = scan_cache_files(&root, &HashSet::new())?;
         for file in files {
@@ -139,17 +161,22 @@ impl ContentRepository {
         connection
             .execute("UPDATE creators SET avatar_path=NULL, banner_path=NULL", [])
             .map_err(|error| error.to_string())?;
+        let _ = connection.execute("DELETE FROM thumb_refs", []);
+        let _ = connection.execute("DELETE FROM thumb_blobs", []);
         drop(connection);
         let legacy_previews = root.join("previews");
         if legacy_previews.exists() {
             let _ = std::fs::remove_dir_all(&legacy_previews);
         }
-        remove_empty_cache_dirs(&root)?;
-        self.cache_stats()
+        let thumbs = thumbs_cache_path();
+        if thumbs.exists() {
+            let _ = std::fs::remove_dir_all(&thumbs);
+        }
+        remove_empty_cache_dirs(&root)
     }
 
     pub fn clear_all_cache(&self) -> Result<CacheStats, String> {
-        self.clear_cached_images()?;
+        self.remove_cached_images()?;
         let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
         let transaction = connection
             .transaction()
@@ -177,31 +204,18 @@ impl ContentRepository {
                    SELECT 1 FROM download_jobs job
                    WHERE job.service=post.service AND job.creator_id=post.creator_id
                      AND job.post_id=post.post_id
-                 )",
-                [],
-            )
-            .map_err(|error| error.to_string())?;
-        transaction
-            .execute(
-                "DELETE FROM creators AS creator
-                 WHERE NOT EXISTS (
-                   SELECT 1 FROM posts post
-                   WHERE post.service=creator.service AND post.creator_id=creator.creator_id
-                 )
-                 AND NOT EXISTS (
-                   SELECT 1 FROM content_pins pin
-                   WHERE pin.service=creator.service AND pin.creator_id=creator.creator_id
                  )
                  AND NOT EXISTS (
                    SELECT 1 FROM subscriptions sub
-                   WHERE sub.service=creator.service AND sub.creator_id=creator.creator_id
+                   WHERE sub.service=post.service AND sub.creator_id=post.creator_id
                  )",
                 [],
             )
             .map_err(|error| error.to_string())?;
+        // Creators without posts are the Creators tab directory, not cache.
         transaction.commit().map_err(|error| error.to_string())?;
-        let _ = connection.execute_batch("PRAGMA optimize; VACUUM;");
         drop(connection);
+        self.compact();
         self.cache_stats()
     }
 
@@ -258,8 +272,8 @@ impl ContentRepository {
             .execute("DELETE FROM sync_records", [])
             .map_err(|e| e.to_string())?;
         transaction.commit().map_err(|error| error.to_string())?;
-        let _ = connection.execute_batch("PRAGMA optimize; VACUUM;");
         drop(connection);
+        self.compact();
         self.cache_stats()
     }
 
@@ -292,21 +306,9 @@ impl ContentRepository {
                        WHERE job.service=post.service AND job.creator_id=post.creator_id
                          AND job.post_id=post.post_id
                      )
-                   ), 0) +
-                   COALESCE((
-                     SELECT SUM(length(CAST(snapshot_json AS BLOB)) + length(CAST(name AS BLOB)))
-                     FROM creators creator
-                     WHERE NOT EXISTS (
-                       SELECT 1 FROM posts post
-                       WHERE post.service=creator.service AND post.creator_id=creator.creator_id
-                     )
-                     AND NOT EXISTS (
-                       SELECT 1 FROM content_pins pin
-                       WHERE pin.service=creator.service AND pin.creator_id=creator.creator_id
-                     )
                      AND NOT EXISTS (
                        SELECT 1 FROM subscriptions sub
-                       WHERE sub.service=creator.service AND sub.creator_id=creator.creator_id
+                       WHERE sub.service=post.service AND sub.creator_id=post.creator_id
                      )
                    ), 0)",
                 [],
@@ -355,7 +357,9 @@ impl ContentRepository {
         let root = content_cache_path();
         let protected = self.protected_cache_paths()?;
         let mut files = scan_cache_files(&root, &protected)?;
-        let mut total = files.iter().map(|file| file.size).sum::<u64>();
+        let files_bytes = files.iter().map(|file| file.size).sum::<u64>();
+        let metadata_bytes = self.cached_metadata_bytes().unwrap_or(0);
+        let mut total = files_bytes.saturating_add(metadata_bytes);
         files.sort_by_key(|file| file.modified_at);
 
         let mut removed = Vec::new();
@@ -381,6 +385,7 @@ impl ContentRepository {
 
         if !removed.is_empty() {
             let connection = self.connection.lock().map_err(|error| error.to_string())?;
+            let thumbs_dir = thumbs_cache_path();
             for path in removed {
                 let value = path.to_string_lossy();
                 connection
@@ -401,9 +406,57 @@ impl ContentRepository {
                         [&value],
                     )
                     .map_err(|error| error.to_string())?;
+
+                if let Ok(rel) = path.strip_prefix(&thumbs_dir) {
+                    let rel_norm = rel.to_string_lossy().replace('\\', "/");
+                    let _ = connection.execute(
+                        "DELETE FROM thumb_blobs WHERE relative_path=?1",
+                        [&rel_norm],
+                    );
+                }
             }
             drop(connection);
             remove_empty_cache_dirs(&root)?;
+        }
+
+        if total > target_bytes || metadata_bytes > (target_bytes / 2) {
+            let mut connection = self.connection.lock().map_err(|error| error.to_string())?;
+            let tx = connection
+                .transaction()
+                .map_err(|error| error.to_string())?;
+            let _ = tx.execute(
+                "DELETE FROM content_lists WHERE datetime(cached_at) < datetime('now', '-7 days')",
+                [],
+            );
+            let _ = tx.execute(
+                "DELETE FROM posts WHERE rowid IN (
+                    SELECT post.rowid FROM posts post
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM content_pins pin
+                        WHERE pin.entity_kind='post' AND pin.service=post.service
+                          AND pin.creator_id=post.creator_id AND pin.post_id=post.post_id
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM collection_posts item
+                        WHERE item.service=post.service AND item.creator_id=post.creator_id
+                          AND item.post_id=post.post_id
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM download_jobs job
+                        WHERE job.service=post.service AND job.creator_id=post.creator_id
+                          AND job.post_id=post.post_id
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM subscriptions sub
+                        WHERE sub.service=post.service AND sub.creator_id=post.creator_id
+                    )
+                    ORDER BY post.cached_at ASC
+                    LIMIT 5000
+                )",
+                [],
+            );
+            tx.commit().map_err(|error| error.to_string())?;
+            let _ = connection.execute_batch("PRAGMA optimize; PRAGMA incremental_vacuum;");
         }
 
         self.cache_stats()
@@ -418,6 +471,7 @@ impl ContentRepository {
                    EXISTS (SELECT 1 FROM content_pins pin WHERE pin.service=p.service AND pin.creator_id=p.creator_id AND pin.entity_kind='post' AND pin.post_id=p.post_id)
                    OR EXISTS (SELECT 1 FROM collection_posts cp WHERE cp.service=p.service AND cp.creator_id=p.creator_id AND cp.post_id=p.post_id)
                    OR EXISTS (SELECT 1 FROM download_jobs job WHERE job.service=p.service AND job.creator_id=p.creator_id AND job.post_id=p.post_id)
+                   OR EXISTS (SELECT 1 FROM subscriptions sub WHERE sub.service=p.service AND sub.creator_id=p.creator_id)
                  )
                  UNION ALL
                  SELECT c.avatar_path FROM creators c
@@ -440,9 +494,36 @@ impl ContentRepository {
         let rows = statement
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(|error| error.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())
-            .map(|paths| paths.into_iter().map(PathBuf::from).collect())
+        let mut paths: HashSet<PathBuf> = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+
+        let mut thumb_stmt = connection
+            .prepare(
+                "SELECT b.relative_path FROM thumb_refs r
+                 JOIN thumb_blobs b ON r.content_key = b.content_key
+                 WHERE (
+                   EXISTS (SELECT 1 FROM content_pins pin WHERE pin.service=r.service AND pin.creator_id=r.creator_id AND pin.post_id=r.post_id)
+                   OR EXISTS (SELECT 1 FROM collection_posts cp WHERE cp.service=r.service AND cp.creator_id=r.creator_id AND cp.post_id=r.post_id)
+                   OR EXISTS (SELECT 1 FROM download_jobs job WHERE job.service=r.service AND job.creator_id=r.creator_id AND job.post_id=r.post_id)
+                   OR EXISTS (SELECT 1 FROM content_pins pin WHERE pin.service=r.service AND pin.creator_id=r.creator_id AND pin.entity_kind='creator')
+                   OR EXISTS (SELECT 1 FROM download_jobs job WHERE job.media_id=r.media_id)
+                   OR EXISTS (SELECT 1 FROM subscriptions sub WHERE sub.service=r.service AND sub.creator_id=r.creator_id)
+                 )",
+            )
+            .map_err(|error| error.to_string())?;
+        let thumb_rows = thumb_stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        let thumbs_dir = thumbs_cache_path();
+        for rel in thumb_rows.flatten() {
+            paths.insert(thumbs_dir.join(rel));
+        }
+
+        Ok(paths)
     }
 
     pub fn save_posts(&self, posts: &[Post]) -> Result<(), String> {
@@ -474,6 +555,20 @@ impl ContentRepository {
                     cached_at=CURRENT_TIMESTAMP, last_checked_at=CURRENT_TIMESTAMP",
                 params![clean_post.service, clean_post.user, clean_post.id, clean_post.title, clean_post.content, clean_post.published, snapshot, clean_post.preview_path],
             ).map_err(|e| e.to_string())?;
+
+            let _ = tx.execute(
+                "INSERT OR IGNORE INTO content_pins(entity_kind, service, creator_id, post_id, reason)
+                 SELECT 'post', ?1, ?2, ?3, 'subscription'
+                 FROM subscriptions WHERE service=?1 AND creator_id=?2",
+                params![clean_post.service, clean_post.user, clean_post.id],
+            );
+
+            let _ = tx.execute(
+                "INSERT OR IGNORE INTO content_pins(entity_kind, service, creator_id, post_id, reason)
+                 SELECT 'post', ?1, ?2, ?3, 'library'
+                 FROM collection_posts WHERE service=?1 AND creator_id=?2 AND post_id=?3",
+                params![clean_post.service, clean_post.user, clean_post.id],
+            );
         }
         tx.commit().map_err(|e| e.to_string())
     }
@@ -495,6 +590,23 @@ impl ContentRepository {
             .map_err(|e| e.to_string())?;
         row.map(|(value, preview)| map_post_row(value, preview))
             .transpose()
+    }
+
+    pub fn get_post_raw_json(
+        &self,
+        service: &str,
+        creator_id: &str,
+        post_id: &str,
+    ) -> Result<Option<String>, String> {
+        let connection = self.connection.lock().map_err(|e| e.to_string())?;
+        connection
+            .query_row(
+                "SELECT snapshot_json FROM posts WHERE service=?1 AND creator_id=?2 AND post_id=?3",
+                params![service, creator_id, post_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
     }
 
     pub fn find_post_identity(
@@ -623,6 +735,23 @@ impl ContentRepository {
         Ok(())
     }
 
+    pub fn get_post_list_age_secs(
+        &self,
+        list_key: &str,
+        offset: u32,
+    ) -> Result<Option<i64>, String> {
+        let connection = self.connection.lock().map_err(|e| e.to_string())?;
+        connection
+            .query_row(
+                "SELECT CAST(strftime('%s', 'now') - strftime('%s', cached_at) AS INTEGER)
+                 FROM content_lists WHERE list_key=?1 AND page_offset=?2",
+                params![list_key, offset],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
     pub fn load_post_list(&self, list_key: &str, offset: u32) -> Result<Vec<Post>, String> {
         let connection = self.connection.lock().map_err(|e| e.to_string())?;
         let json: Option<String> = connection
@@ -638,18 +767,53 @@ impl ContentRepository {
         };
         let identities: Vec<(String, String, String)> =
             serde_json::from_str(&json).map_err(|e| e.to_string())?;
-        let mut posts = Vec::with_capacity(identities.len());
-        for (service, creator_id, post_id) in identities {
-            let row: Option<(String, Option<String>)> = connection
-                .query_row(
-                    "SELECT snapshot_json,preview_path FROM posts WHERE service=?1 AND creator_id=?2 AND post_id=?3",
-                    params![service, creator_id, post_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
+        if identities.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut map: HashMap<(String, String, String), Post> =
+            HashMap::with_capacity(identities.len());
+        for chunk in identities.chunks(50) {
+            let mut sql = String::from(
+                "SELECT service, creator_id, post_id, snapshot_json, preview_path FROM posts WHERE ",
+            );
+            for i in 0..chunk.len() {
+                if i > 0 {
+                    sql.push_str(" OR ");
+                }
+                sql.push_str("(service = ? AND creator_id = ? AND post_id = ?)");
+            }
+            let mut stmt = connection.prepare(&sql).map_err(|e| e.to_string())?;
+            let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 3);
+            for (s, c, p) in chunk {
+                params_vec.push(s);
+                params_vec.push(c);
+                params_vec.push(p);
+            }
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(params_vec), |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                    ))
+                })
                 .map_err(|e| e.to_string())?;
-            if let Some((snapshot, preview)) = row {
-                posts.push(map_post_row(snapshot, preview)?);
+            for row in rows {
+                let (service, creator_id, post_id, snapshot, preview) =
+                    row.map_err(|e| e.to_string())?;
+                if let Ok(post) = map_post_row(snapshot, preview) {
+                    map.insert((service, creator_id, post_id), post);
+                }
+            }
+        }
+
+        let mut posts = Vec::with_capacity(identities.len());
+        for identity in identities {
+            if let Some(post) = map.remove(&identity) {
+                posts.push(post);
             }
         }
         Ok(posts)
@@ -869,7 +1033,7 @@ impl ContentRepository {
 
         let mut prepared = Vec::with_capacity(creators.len());
         for c in creators {
-            let snapshot = serde_json::to_string(c).map_err(|e| e.to_string())?;
+            let snapshot = crate::db::storage::snapshot_json(c)?;
             let favorited = Self::extract_creator_favorited(c);
             let updated_at = Self::extract_creator_timestamp(c.updated);
             let indexed_at = Self::extract_creator_timestamp(c.indexed);
@@ -1171,7 +1335,7 @@ impl ContentRepository {
         name: &str,
         creator: &T,
     ) -> Result<(), String> {
-        let snapshot = serde_json::to_string(creator).map_err(|e| e.to_string())?;
+        let snapshot = crate::db::storage::snapshot_json(creator)?;
         let connection = self.connection.lock().map_err(|e| e.to_string())?;
         connection.execute(
             "INSERT INTO creators(service,creator_id,name,snapshot_json,last_checked_at)
@@ -1258,24 +1422,33 @@ impl ContentRepository {
         let connection = self.connection.lock().map_err(|e| e.to_string())?;
         let (sql, entity_kind) = if kind == "artist" {
             (
-                "SELECT c.snapshot_json, MAX(pin.created_at) AS faved_at FROM content_pins pin JOIN creators c USING(service,creator_id) WHERE pin.entity_kind=?1 AND pin.reason='favorite' AND (pin.account_id=?2 OR (?2 != '' AND pin.account_id='')) GROUP BY c.service, c.creator_id ORDER BY faved_at DESC",
+                "SELECT c.snapshot_json, MAX(pin.created_at) AS faved_at, c.avatar_path, c.banner_path, c.service, c.creator_id FROM content_pins pin JOIN creators c USING(service,creator_id) WHERE pin.entity_kind=?1 AND pin.reason='favorite' AND (pin.account_id=?2 OR (?2 != '' AND pin.account_id='')) GROUP BY c.service, c.creator_id ORDER BY faved_at DESC",
                 "creator",
             )
         } else {
             (
-                "SELECT p.snapshot_json, MAX(pin.created_at) AS faved_at FROM content_pins pin JOIN posts p USING(service,creator_id,post_id) WHERE pin.entity_kind=?1 AND pin.reason='favorite' AND (pin.account_id=?2 OR (?2 != '' AND pin.account_id='')) GROUP BY p.service, p.creator_id, p.post_id ORDER BY faved_at DESC",
+                "SELECT p.snapshot_json, MAX(pin.created_at) AS faved_at, p.preview_path, NULL, p.service, p.creator_id FROM content_pins pin JOIN posts p USING(service,creator_id,post_id) WHERE pin.entity_kind=?1 AND pin.reason='favorite' AND (pin.account_id=?2 OR (?2 != '' AND pin.account_id='')) GROUP BY p.service, p.creator_id, p.post_id ORDER BY faved_at DESC",
                 "post",
             )
         };
         let mut statement = connection.prepare(sql).map_err(|e| e.to_string())?;
         let rows = statement
             .query_map(params![entity_kind, account_id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
             })
             .map_err(|e| e.to_string())?;
         let mut favorites = Vec::new();
+        let cache_root = content_cache_path();
+        let avatars_dir = cache_root.join("avatars");
         for item in rows.flatten() {
-            let (json, created_at_str) = item;
+            let (json, created_at_str, avatar_or_preview, banner_path, srv, creator_id) = item;
             match serde_json::from_str::<Favorite>(&json) {
                 Ok(mut fav) => {
                     if let Some(created_str) = created_at_str {
@@ -1283,6 +1456,60 @@ impl ContentRepository {
                             "faved_at".to_string(),
                             serde_json::Value::String(created_str),
                         );
+                    }
+                    if kind == "artist" {
+                        let valid_avatar = if let Some(ref av) = avatar_or_preview {
+                            if std::path::Path::new(av).is_file() {
+                                Some(av.clone())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        let resolved_avatar = valid_avatar.or_else(|| {
+                            let s = sanitize_cache_key(&srv);
+                            let id = sanitize_cache_key(&creator_id);
+                            for ext in &["jpg", "jpeg", "png", "webp", "gif"] {
+                                let direct = avatars_dir.join(format!("{s}_{id}_avatar.{ext}"));
+                                if direct.is_file() {
+                                    return Some(direct.to_string_lossy().into_owned());
+                                }
+                            }
+                            if let Ok(entries) = std::fs::read_dir(&avatars_dir) {
+                                let prefix = format!("{s}_{id}_");
+                                for entry in entries.flatten() {
+                                    let name = entry.file_name().to_string_lossy().into_owned();
+                                    if name.starts_with(&prefix) && name.contains("avatar") {
+                                        let p = entry.path();
+                                        if p.is_file() {
+                                            return Some(p.to_string_lossy().into_owned());
+                                        }
+                                    }
+                                }
+                            }
+                            None
+                        });
+
+                        if let Some(av) = resolved_avatar {
+                            fav.extra
+                                .insert("avatar_path".to_string(), serde_json::Value::String(av));
+                        }
+                        if let Some(ref bn) = banner_path {
+                            if std::path::Path::new(bn).is_file() {
+                                fav.extra.insert(
+                                    "banner_path".to_string(),
+                                    serde_json::Value::String(bn.clone()),
+                                );
+                            }
+                        }
+                    } else if let Some(preview) = avatar_or_preview {
+                        if std::path::Path::new(&preview).is_file() {
+                            fav.extra.insert(
+                                "preview_path".to_string(),
+                                serde_json::Value::String(preview),
+                            );
+                        }
                     }
                     favorites.push(fav);
                 }
@@ -1403,33 +1630,63 @@ impl ContentRepository {
     }
 
     pub fn store_thumbnail_data_url(&self, key: &str, data_url: &str) -> Result<PathBuf, String> {
-        let (header, encoded) = data_url
+        let (_header, encoded) = data_url
             .split_once(',')
             .ok_or("Invalid thumbnail data URL")?;
-        let extension = if header.contains("png") {
-            "png"
-        } else if header.contains("webp") {
-            "webp"
-        } else {
-            "jpg"
-        };
         let bytes = BASE64_STANDARD.decode(encoded).map_err(|e| e.to_string())?;
-        let dir = content_cache_path().join("thumbnails");
+        if bytes.len() < 256 {
+            return Err("Thumbnail data is too small to be valid".to_string());
+        }
+
+        let hash = format!("{:x}", Sha256::digest(key.as_bytes()));
+        let safe_name = sanitize_cache_key(key);
+        let filename = if safe_name.len() > 100 {
+            format!("{}_{}.webp", &safe_name[..40], &hash[..16])
+        } else {
+            format!("{safe_name}.webp")
+        };
+        let dir = thumbs_cache_path();
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let safe = format!("{}.{}", sanitize_cache_key(key), extension);
-        let path = dir.join(safe);
+        let path = dir.join(&filename);
+        let relative = filename.clone();
         std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
 
         let connection = self.connection.lock().map_err(|e| e.to_string())?;
+        connection
+            .execute(
+                "INSERT INTO thumb_blobs (content_key, size, relative_path, last_access_at)
+                 VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)
+                 ON CONFLICT(content_key) DO UPDATE SET size = ?2, relative_path = ?3, last_access_at = CURRENT_TIMESTAMP",
+                params![hash, bytes.len() as u64, relative],
+            )
+            .map_err(|e| e.to_string())?;
+
         let path_str = path.to_string_lossy();
         if let Some(post_key) = key.strip_prefix("post:") {
             let parts: Vec<&str> = post_key.split(':').collect();
-            if parts.len() == 3 {
+            if parts.len() >= 3 {
+                let service = parts[0];
+                let creator_id = parts[1];
+                let post_id = parts[2];
+                let media_id = parts.get(3).copied().unwrap_or("");
+                let _ = connection.execute(
+                    "INSERT INTO thumb_refs (service, creator_id, post_id, media_id, content_key, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP)
+                     ON CONFLICT(service, creator_id, post_id, media_id) DO UPDATE SET content_key = excluded.content_key",
+                    params![service, creator_id, post_id, media_id, hash],
+                );
                 let _ = connection.execute(
                     "UPDATE posts SET preview_path=?1 WHERE service=?2 AND creator_id=?3 AND post_id=?4",
-                    params![path_str, parts[0], parts[1], parts[2]],
+                    params![path_str, service, creator_id, post_id],
                 );
             }
+        } else {
+            let _ = connection.execute(
+                "INSERT INTO thumb_refs (service, creator_id, post_id, media_id, content_key, created_at)
+                 VALUES ('', '', '', ?1, ?2, CURRENT_TIMESTAMP)
+                 ON CONFLICT(service, creator_id, post_id, media_id) DO UPDATE SET content_key = excluded.content_key",
+                params![key, hash],
+            );
         }
         drop(connection);
 
@@ -1438,7 +1695,69 @@ impl ContentRepository {
     }
 
     pub fn thumbnail_path(&self, key: &str) -> Option<String> {
-        let dir = content_cache_path().join("thumbnails");
+        let hash = format!("{:x}", Sha256::digest(key.as_bytes()));
+        if let Ok(connection) = self.connection.lock() {
+            let rel_opt: Option<String> = connection
+                .query_row(
+                    "SELECT relative_path FROM thumb_blobs WHERE content_key = ?1",
+                    params![hash],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap_or(None);
+
+            if let Some(rel) = rel_opt {
+                let full = thumbs_cache_path().join(rel);
+                if full.is_file() {
+                    return Some(full.to_string_lossy().into_owned());
+                }
+            }
+
+            if let Some(post_key) = key.strip_prefix("post:") {
+                let parts: Vec<&str> = post_key.split(':').collect();
+                if parts.len() == 3 {
+                    let rel_ref: Option<String> = connection
+                        .query_row(
+                            "SELECT b.relative_path FROM thumb_refs r
+                             JOIN thumb_blobs b ON r.content_key = b.content_key
+                             WHERE r.service = ?1 AND r.creator_id = ?2 AND r.post_id = ?3
+                             LIMIT 1",
+                            params![parts[0], parts[1], parts[2]],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                        .unwrap_or(None);
+
+                    if let Some(rel) = rel_ref {
+                        let full = thumbs_cache_path().join(rel);
+                        if full.is_file() {
+                            return Some(full.to_string_lossy().into_owned());
+                        }
+                    }
+                }
+            } else {
+                let rel_ref: Option<String> = connection
+                    .query_row(
+                        "SELECT b.relative_path FROM thumb_refs r
+                         JOIN thumb_blobs b ON r.content_key = b.content_key
+                         WHERE r.media_id = ?1
+                         LIMIT 1",
+                        params![key],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .unwrap_or(None);
+
+                if let Some(rel) = rel_ref {
+                    let full = thumbs_cache_path().join(rel);
+                    if full.is_file() {
+                        return Some(full.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+
+        let dir = thumbs_cache_path();
         for ext in &["webp", "jpg", "png"] {
             let path = dir.join(format!("{}.{}", sanitize_cache_key(key), ext));
             if path.is_file() {
@@ -1449,23 +1768,15 @@ impl ContentRepository {
     }
 
     pub fn thumbnail_data_url(&self, key: &str) -> Result<Option<String>, String> {
-        let dir = content_cache_path().join("thumbnails");
-        for ext in &["webp", "jpg", "png"] {
-            let path = dir.join(format!("{}.{}", sanitize_cache_key(key), ext));
-            if path.is_file() {
-                let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-                let mime = if *ext == "webp" {
-                    "image/webp"
-                } else if *ext == "png" {
-                    "image/png"
-                } else {
-                    "image/jpeg"
-                };
-                let encoded = BASE64_STANDARD.encode(bytes);
-                return Ok(Some(format!("data:{mime};base64,{encoded}")));
-            }
-        }
-        Ok(None)
+        let Some(path) = self.thumbnail_path(key) else {
+            return Ok(None);
+        };
+        let mime = mime_guess::from_path(&path).first_or_octet_stream();
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+        Ok(Some(format!(
+            "data:{mime};base64,{}",
+            BASE64_STANDARD.encode(bytes)
+        )))
     }
 
     pub async fn cache_post_preview(
@@ -1534,10 +1845,9 @@ impl ContentRepository {
         creator_id: &str,
         kind: &str,
         url: &str,
-        provider_id: Option<&str>,
+        _provider_id: Option<&str>,
         client: &reqwest::Client,
     ) -> Result<Option<PathBuf>, String> {
-        let is_specific = provider_id.is_some_and(|pid| pid != "auto" && !pid.trim().is_empty());
         let dir = content_cache_path().join(if kind == "banner" {
             "banners"
         } else {
@@ -1546,21 +1856,18 @@ impl ContentRepository {
         let s_san = sanitize_cache_key(service);
         let id_san = sanitize_cache_key(creator_id);
 
-        let existing = if is_specific {
-            let pid = provider_id.unwrap();
-            let p_san = sanitize_cache_key(pid);
-            let mut found = None;
-            for ext in &["webp", "png", "jpg", "jpeg", "gif"] {
-                let p = dir.join(format!("{s_san}_{id_san}_{p_san}_{kind}.{ext}"));
-                if p.is_file() {
-                    found = Some(p.to_string_lossy().into_owned());
-                    break;
+        let existing = self.artwork_path(service, creator_id, kind)?.or_else(|| {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                let prefix = format!("{s_san}_{id_san}_");
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name.starts_with(&prefix) && name.contains(kind) {
+                        return Some(entry.path().to_string_lossy().into_owned());
+                    }
                 }
             }
-            found
-        } else {
-            self.artwork_path(service, creator_id, kind)?
-        };
+            None
+        });
 
         let mut req = client.get(url);
         if let Some(ref path_str) = existing {
@@ -1612,30 +1919,33 @@ impl ContentRepository {
         };
 
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let safe = if is_specific {
-            let p_san = sanitize_cache_key(provider_id.unwrap());
-            format!("{s_san}_{id_san}_{p_san}_{kind}.{ext}")
-        } else {
-            format!("{s_san}_{id_san}_{kind}.{ext}")
-        };
-        let path = dir.join(safe);
+        let safe = format!("{s_san}_{id_san}_{kind}.{ext}");
+        let path = dir.join(&safe);
         std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
 
-        if !is_specific {
-            let column = if kind == "banner" {
-                "banner_path"
-            } else {
-                "avatar_path"
-            };
-            let connection = self.connection.lock().map_err(|e| e.to_string())?;
-            connection
-                .execute(
-                    &format!("UPDATE creators SET {column}=?3, last_checked_at=CURRENT_TIMESTAMP WHERE service=?1 AND creator_id=?2"),
-                    params![service, creator_id, path.to_string_lossy()],
-                )
-                .map_err(|e| e.to_string())?;
-            drop(connection);
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let prefix = format!("{s_san}_{id_san}_");
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with(&prefix) && name.contains(kind) && name != safe {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
         }
+
+        let column = if kind == "banner" {
+            "banner_path"
+        } else {
+            "avatar_path"
+        };
+        let connection = self.connection.lock().map_err(|e| e.to_string())?;
+        connection
+            .execute(
+                &format!("UPDATE creators SET {column}=?3, last_checked_at=CURRENT_TIMESTAMP WHERE service=?1 AND creator_id=?2"),
+                params![service, creator_id, path.to_string_lossy()],
+            )
+            .map_err(|e| e.to_string())?;
+        drop(connection);
 
         self.enforce_cache_limit_after_write(bytes.len() as u64);
         Ok(Some(path))
@@ -1684,13 +1994,7 @@ fn cache_stats_from_files(files: &[CacheFile]) -> CacheStats {
     let bytes_for = |directory: &str| {
         files
             .iter()
-            .filter(|file| {
-                file.path
-                    .parent()
-                    .and_then(Path::file_name)
-                    .and_then(|value| value.to_str())
-                    == Some(directory)
-            })
+            .filter(|file| file.path.components().any(|c| c.as_os_str() == directory))
             .map(|file| file.size)
             .sum::<u64>()
     };

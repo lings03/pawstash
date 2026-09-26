@@ -8,7 +8,7 @@ pub fn path_has_image_mime(path: &str) -> bool {
         .is_some_and(|mime| mime.starts_with("image/"))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderConfig {
     pub id: String,
     pub name: String,
@@ -34,6 +34,101 @@ pub struct ProviderConfig {
     pub is_custom: bool,
     #[serde(default)]
     pub priority: u32,
+    #[serde(default)]
+    pub advanced_network: bool,
+    /// Empty or 0 means the global value.
+    #[serde(default)]
+    pub user_agent: String,
+    #[serde(default)]
+    pub timeout_secs: u64,
+    #[serde(default)]
+    pub proxy_url: String,
+    #[serde(default)]
+    pub max_retries: u64,
+    #[serde(default)]
+    pub min_interval_ms: u64,
+}
+
+impl ProviderConfig {
+    fn override_active(&self) -> bool {
+        self.advanced_network
+    }
+
+    pub fn effective_user_agent(&self) -> String {
+        if self.override_active() && !self.user_agent.trim().is_empty() {
+            self.user_agent.trim().to_string()
+        } else {
+            crate::net::api_user_agent()
+        }
+    }
+
+    pub fn effective_timeout(&self) -> std::time::Duration {
+        if self.override_active() && self.timeout_secs > 0 {
+            std::time::Duration::from_secs(self.timeout_secs)
+        } else {
+            crate::net::defaults().request_timeout
+        }
+    }
+
+    pub fn effective_proxy_url(&self) -> Option<String> {
+        if self.override_active() && !self.proxy_url.trim().is_empty() {
+            Some(self.proxy_url.trim().to_string())
+        } else {
+            None
+        }
+    }
+
+    pub fn apply_queue_overrides(
+        &self,
+        mut config: super::queue::ProviderQueueConfig,
+    ) -> super::queue::ProviderQueueConfig {
+        if !self.override_active() {
+            return config;
+        }
+        if self.max_retries > 0 {
+            config.max_retries = self.max_retries as usize;
+        }
+        if self.min_interval_ms > 0 {
+            config.min_interval = std::time::Duration::from_millis(self.min_interval_ms);
+        }
+        config
+    }
+
+    pub fn apply_network_to(&self, settings: &mut crate::config::settings::AppSettings) {
+        let global = crate::net::defaults();
+        match self.effective_proxy_url() {
+            Some(url) => {
+                settings.proxy_mode = crate::config::settings::ProxyMode::Custom;
+                settings.proxy_url = url;
+                settings.proxy_username = String::new();
+                settings.proxy_password = String::new();
+                settings.proxy_bypass_local = true;
+            }
+            None => {
+                settings.proxy_mode = global.proxy.mode;
+                settings.proxy_url = global.proxy.url.clone();
+                settings.proxy_username = global.proxy.username.clone();
+                settings.proxy_password = global.proxy.password.clone();
+                settings.proxy_bypass_local = global.proxy.bypass_local;
+            }
+        }
+        if self.override_active() && self.timeout_secs > 0 {
+            settings.network_timeout_secs = self.timeout_secs;
+        }
+    }
+
+    pub fn network_builder(&self) -> reqwest::ClientBuilder {
+        match self.effective_proxy_url() {
+            Some(url) => match reqwest::Proxy::all(&url) {
+                Ok(proxy) => crate::net::builder().proxy(proxy),
+                Err(error) => {
+                    tracing::warn!(provider = %self.id, %error, "Invalid provider proxy URL; using global proxy");
+                    crate::net::builder_proxied()
+                }
+            },
+            None => crate::net::builder_proxied(),
+        }
+    }
 }
 
 fn serialize_redacted_secret<S>(_: &String, serializer: S) -> Result<S::Ok, S::Error>
@@ -414,4 +509,71 @@ pub trait SourceProvider: Send + Sync {
         post_id: &str,
     ) -> Result<Option<(String, String, String)>, String>;
     async fn expand_short_link(&self, raw_url: &str) -> Result<Option<String>, String>;
+}
+
+#[cfg(test)]
+mod provider_network_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn tuned() -> ProviderConfig {
+        ProviderConfig {
+            id: "test".to_string(),
+            user_agent: "  Tuned/1.0  ".to_string(),
+            timeout_secs: 12,
+            proxy_url: "  http://127.0.0.1:9000  ".to_string(),
+            max_retries: 7,
+            min_interval_ms: 250,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn overrides_are_inert_until_advanced_network_is_on() {
+        let config = tuned();
+        assert_ne!(config.effective_user_agent(), "Tuned/1.0");
+        assert_eq!(
+            config.effective_timeout(),
+            crate::net::defaults().request_timeout
+        );
+        assert_eq!(config.effective_proxy_url(), None);
+
+        let queue =
+            config.apply_queue_overrides(super::super::queue::ProviderQueueConfig::default());
+        assert_eq!(queue.max_retries, 3);
+    }
+
+    #[test]
+    fn enabled_overrides_are_applied_and_trimmed() {
+        let config = ProviderConfig {
+            advanced_network: true,
+            ..tuned()
+        };
+        assert_eq!(config.effective_user_agent(), "Tuned/1.0");
+        assert_eq!(config.effective_timeout(), Duration::from_secs(12));
+        assert_eq!(
+            config.effective_proxy_url().as_deref(),
+            Some("http://127.0.0.1:9000")
+        );
+
+        let queue =
+            config.apply_queue_overrides(super::super::queue::ProviderQueueConfig::default());
+        assert_eq!(queue.max_retries, 7);
+        assert_eq!(queue.min_interval, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn blank_fields_fall_through_to_the_global_value() {
+        let config = ProviderConfig {
+            advanced_network: true,
+            id: "test".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.effective_user_agent(), crate::net::api_user_agent());
+        assert_eq!(
+            config.effective_timeout(),
+            crate::net::defaults().request_timeout
+        );
+        assert_eq!(config.effective_proxy_url(), None);
+    }
 }

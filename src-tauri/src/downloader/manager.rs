@@ -1,10 +1,9 @@
-use crate::config::settings::{AppSettings, ConfigManager, ProxyMode};
-use crate::db::downloads::{DownloadJob, DownloadRepository, NewDownloadJob};
+use crate::config::settings::{AppSettings, ConfigManager};
+use crate::db::content::ContentRepository;
+use crate::db::downloads::{DownloadJob, DownloadRepository, NewDownloadJob, AUTO_RETRY_CODE};
 use crate::downloader::aria2c::Aria2cManager;
 use crate::downloader::native::NativeDownloader;
-use crate::downloader::template::{
-    resolve_creator_folder, resolve_filename, resolve_post_folder, TemplateContext,
-};
+use crate::downloader::template::{resolve_filename, resolve_target_dir, TemplateContext};
 use crate::downloader::{DownloadControl, DownloadRunError, DownloadTask, Interruption};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -17,18 +16,66 @@ use uuid::Uuid;
 pub struct DownloadManager {
     repository: Arc<DownloadRepository>,
     config: Arc<ConfigManager>,
+    content_repo: Option<Arc<ContentRepository>>,
     active: Mutex<HashMap<String, Arc<DownloadControl>>>,
     notify: Arc<tokio::sync::Notify>,
+    auto_retries: Mutex<HashMap<String, u32>>,
+}
+
+const AUTO_RETRY_BASE_DELAY_SECS: u64 = 5;
+const AUTO_RETRY_MAX_DELAY_SECS: u64 = 60;
+
+fn is_transient_failure(message: &str) -> bool {
+    if let Some(status) = message
+        .split("HTTP ")
+        .nth(1)
+        .and_then(|rest| rest.get(..3))
+        .and_then(|code| code.parse::<u16>().ok())
+    {
+        return matches!(status, 408 | 425 | 429 | 500..=599);
+    }
+    const PERMANENT: [&str; 9] = [
+        "Failed to create destination folder",
+        "Failed to write final file",
+        "Invalid temporary",
+        "Invalid proxy URL",
+        "Custom proxy URL is required",
+        "aria2c binary not found",
+        "Refusing",
+        "os error 28",
+        "os error 112",
+    ];
+    !PERMANENT.iter().any(|marker| message.contains(marker))
+}
+
+fn auto_retry_delay(attempt: u32) -> std::time::Duration {
+    let secs = AUTO_RETRY_BASE_DELAY_SECS.saturating_mul(1 << attempt.saturating_sub(1).min(8));
+    std::time::Duration::from_secs(secs.min(AUTO_RETRY_MAX_DELAY_SECS))
 }
 
 impl DownloadManager {
-    pub fn new(repository: Arc<DownloadRepository>, config: Arc<ConfigManager>) -> Self {
+    pub fn new(
+        repository: Arc<DownloadRepository>,
+        config: Arc<ConfigManager>,
+        content_repo: Option<Arc<ContentRepository>>,
+    ) -> Self {
         Self {
             repository,
             config,
+            content_repo,
             active: Mutex::new(HashMap::new()),
             notify: Arc::new(tokio::sync::Notify::new()),
+            auto_retries: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn is_busy(&self) -> bool {
+        let running = self
+            .active
+            .lock()
+            .map(|active| !active.is_empty())
+            .unwrap_or(true);
+        running || self.repository.has_pending_work().unwrap_or(true)
     }
 
     pub fn notify_scheduler(&self) {
@@ -159,35 +206,49 @@ impl DownloadManager {
             media_id: &media_id,
         };
 
-        let mut target_dir = root.clone();
-        if settings.download_group_by_creator {
-            let creator_folder =
-                resolve_creator_folder(&settings.download_creator_folder_template, &ctx);
-            if !creator_folder.is_empty() {
-                target_dir = target_dir.join(creator_folder);
-            }
-        }
-        if settings.download_group_by_post {
-            let post_folder = resolve_post_folder(&settings.download_post_folder_template, &ctx);
-            if !post_folder.is_empty() {
-                target_dir = target_dir.join(post_folder);
-            }
-        }
-
+        let target_dir = resolve_target_dir(&root, &settings, &ctx);
         std::fs::create_dir_all(&target_dir).map_err(|error| error.to_string())?;
 
         if settings.download_save_metadata {
+            let cached_post = self
+                .content_repo
+                .as_ref()
+                .and_then(|r| r.get_post(&service, &creator_id, &post_id).ok().flatten());
+            let cached_raw_json = self.content_repo.as_ref().and_then(|r| {
+                r.get_post_raw_json(&service, &creator_id, &post_id)
+                    .ok()
+                    .flatten()
+            });
+
+            let tags_vec: Option<Vec<String>> = cached_post.as_ref().and_then(|p| {
+                p.tags.as_ref().and_then(|t| {
+                    if let Some(arr) = t.as_array() {
+                        Some(
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect(),
+                        )
+                    } else {
+                        t.as_str()
+                            .map(|s| s.split(',').map(|v| v.trim().to_string()).collect())
+                    }
+                })
+            });
+
             let meta = crate::downloader::metadata::PostMetadataExport {
                 service: &service,
                 creator_id: &creator_id,
                 creator_name: c_name,
                 post_id: &post_id,
                 post_title: p_title,
-                published: published.as_deref(),
-                content: None,
-                tags: None,
-                origin_url: None,
-                source_url: None,
+                published: published
+                    .as_deref()
+                    .or(cached_post.as_ref().and_then(|p| p.published.as_deref())),
+                content: cached_post.as_ref().and_then(|p| p.content.as_deref()),
+                tags: tags_vec.as_deref(),
+                origin_url: cached_post.as_ref().and_then(|p| p.origin.clone()),
+                source_url: cached_post.as_ref().and_then(|p| p.media_url.clone()),
+                raw_json: cached_raw_json.as_deref(),
             };
             let _ = crate::downloader::metadata::save_post_metadata(&target_dir, &meta, &settings);
         }
@@ -207,9 +268,7 @@ impl DownloadManager {
         };
         let _ = std::fs::create_dir_all(&temp_dir);
         let temp_path = temp_dir.join(format!("{id}.part"));
-        let custom_socks = settings.proxy_mode == ProxyMode::Custom
-            && (settings.proxy_url.starts_with("socks5://")
-                || settings.proxy_url.starts_with("socks5h://"));
+        let custom_socks = crate::net::proxy_for_url(&settings, &url).is_socks();
         let engine = if settings.use_aria2c && Aria2cManager::is_installed() && !custom_socks {
             "aria2c"
         } else {
@@ -355,6 +414,7 @@ impl DownloadManager {
     }
 
     pub fn retry(&self, id: &str) -> Result<DownloadJob, String> {
+        self.forget_auto_retries(id);
         let job = self.repository.retry(id)?;
         if job.status != "queued" {
             return Err("Only failed, cancelled, or missing downloads can be retried".to_string());
@@ -571,14 +631,27 @@ impl DownloadManager {
             app_handle: app_handle.clone(),
         };
 
+        let auto_retry_max = settings
+            .download_auto_retry
+            .then_some(settings.download_auto_retry_max);
         match self.run_inner(&id, settings, control, &app_handle).await {
             Err(DownloadRunError::Failed(message)) => {
-                tracing::error!(id = %id, error = %message, "Download job failed");
-                if let Ok(job) = self
-                    .repository
-                    .mark_failed(&id, "download_failed", &message)
-                {
-                    let _ = app_handle.emit("download-job-updated", job);
+                if let Some(attempt) = self.claim_auto_retry(&id, &message, auto_retry_max) {
+                    let delay = auto_retry_delay(attempt);
+                    tracing::warn!(id = %id, error = %message, attempt, delay_secs = delay.as_secs(), "Download failed; retrying automatically");
+                    if let Ok(job) = self.repository.mark_failed(&id, AUTO_RETRY_CODE, &message) {
+                        let _ = app_handle.emit("download-job-updated", job);
+                    }
+                    self.schedule_auto_retry(id.clone(), delay, app_handle.clone());
+                } else {
+                    tracing::error!(id = %id, error = %message, "Download job failed");
+                    self.forget_auto_retries(&id);
+                    if let Ok(job) = self
+                        .repository
+                        .mark_failed(&id, "download_failed", &message)
+                    {
+                        let _ = app_handle.emit("download-job-updated", job);
+                    }
                 }
             }
             Err(DownloadRunError::Interrupted(interruption)) => {
@@ -590,8 +663,50 @@ impl DownloadManager {
                     let _ = app_handle.emit("download-job-updated", job);
                 }
             }
-            Ok(()) => {}
+            Ok(()) => self.forget_auto_retries(&id),
         }
+    }
+
+    fn claim_auto_retry(&self, id: &str, message: &str, max: Option<u32>) -> Option<u32> {
+        let max = max?;
+        if !is_transient_failure(message) {
+            return None;
+        }
+        let mut retries = self.auto_retries.lock().ok()?;
+        let spent = retries.entry(id.to_string()).or_insert(0);
+        if *spent >= max {
+            return None;
+        }
+        *spent += 1;
+        Some(*spent)
+    }
+
+    fn forget_auto_retries(&self, id: &str) {
+        if let Ok(mut retries) = self.auto_retries.lock() {
+            retries.remove(id);
+        }
+    }
+
+    fn schedule_auto_retry(
+        self: &Arc<Self>,
+        id: String,
+        delay: std::time::Duration,
+        app_handle: tauri::AppHandle,
+    ) {
+        let manager = self.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(delay).await;
+            match manager.repository.requeue_auto_retry(&id) {
+                Ok(Some(job)) => {
+                    let _ = app_handle.emit("download-job-updated", job);
+                    manager.notify.notify_waiters();
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(id = %id, %error, "Failed to re-queue download for automatic retry")
+                }
+            }
+        });
     }
 
     async fn run_inner(
@@ -621,6 +736,7 @@ impl DownloadManager {
             );
         }
 
+        let proxy = crate::net::proxy_for_url(&settings, &job.url);
         let task = DownloadTask {
             id: job.id.clone(),
             url: job.url.clone(),
@@ -629,11 +745,11 @@ impl DownloadManager {
             final_path: job.final_path.clone(),
             filename: job.filename.clone(),
             session_cookie: settings.resolve_cookie_for_url(&job.url),
-            proxy_mode: settings.proxy_mode,
-            proxy_url: settings.proxy_url.clone(),
-            proxy_username: settings.proxy_username.clone(),
-            proxy_password: settings.proxy_password.clone(),
-            proxy_bypass_local: settings.proxy_bypass_local,
+            proxy_mode: proxy.mode,
+            proxy_url: proxy.url,
+            proxy_username: proxy.username,
+            proxy_password: proxy.password,
+            proxy_bypass_local: proxy.bypass_local,
             connections: settings.aria2_connections.clamp(1, 32),
         };
         if job.total_bytes == 0 {
@@ -837,5 +953,42 @@ impl DownloadManager {
             }
         }
         Err("Could not allocate a unique download filename".to_string())
+    }
+}
+
+#[cfg(test)]
+mod auto_retry_tests {
+    use super::*;
+
+    #[test]
+    fn only_transient_failures_are_retried() {
+        assert!(is_transient_failure(
+            "Download failed HTTP 503 Service Unavailable"
+        ));
+        assert!(is_transient_failure(
+            "Download failed HTTP 429 Too Many Requests"
+        ));
+        assert!(is_transient_failure(
+            "error sending request: connection reset"
+        ));
+        assert!(is_transient_failure(
+            "Incomplete download: expected 10 bytes, received 4"
+        ));
+        assert!(!is_transient_failure("Download failed HTTP 404 Not Found"));
+        assert!(!is_transient_failure("Download failed HTTP 403 Forbidden"));
+        assert!(!is_transient_failure(
+            "Failed to write final file: No space left on device (os error 28)"
+        ));
+        assert!(!is_transient_failure(
+            "aria2c binary not found on system PATH"
+        ));
+    }
+
+    #[test]
+    fn retry_delay_backs_off_and_caps() {
+        assert_eq!(auto_retry_delay(1).as_secs(), 5);
+        assert_eq!(auto_retry_delay(2).as_secs(), 10);
+        assert_eq!(auto_retry_delay(3).as_secs(), 20);
+        assert_eq!(auto_retry_delay(10).as_secs(), AUTO_RETRY_MAX_DELAY_SECS);
     }
 }

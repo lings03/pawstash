@@ -153,6 +153,7 @@
 {#if isVisible && layoutState.isMobile}
   <div
     class="ptr-indicator-wrapper {extraClass}"
+    class:pulling
     class:refreshing
     class:ready={thresholdPassed}
     class:exiting
@@ -189,6 +190,11 @@
     opacity: var(--ptr-progress, 0);
     transition: transform 250ms cubic-bezier(0.16, 1, 0.3, 1), opacity 200ms ease;
     will-change: transform, opacity;
+  }
+
+  .ptr-indicator-wrapper.pulling,
+  .ptr-indicator-wrapper.pulling .ptr-icon-wrap {
+    transition: none;
   }
 
   .ptr-indicator-wrapper.refreshing {

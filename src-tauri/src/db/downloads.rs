@@ -38,6 +38,8 @@ pub struct DownloadJob {
     pub creator_avatar_path: Option<String>,
 }
 
+pub const AUTO_RETRY_CODE: &str = "auto_retry";
+
 pub struct NewDownloadJob<'a> {
     pub id: &'a str,
     pub logical_key: &'a str,
@@ -157,7 +159,8 @@ impl DownloadRepository {
         let mut statement = connection
             .prepare(
                 "SELECT id FROM download_jobs
-                 WHERE status IN ('queued', 'resolving', 'downloading', 'verifying')",
+                 WHERE status IN ('queued', 'resolving', 'downloading', 'verifying')
+                    OR (status = 'failed' AND error_code = 'auto_retry')",
             )
             .map_err(|error| error.to_string())?;
         let ids = statement
@@ -169,11 +172,25 @@ impl DownloadRepository {
             .execute(
                 "UPDATE download_jobs SET status = 'queued', speed_bps = 0,
                     error_code = NULL, error_message = NULL, updated_at = CURRENT_TIMESTAMP
-                 WHERE status IN ('resolving', 'downloading', 'verifying')",
+                 WHERE status IN ('resolving', 'downloading', 'verifying')
+                    OR (status = 'failed' AND error_code = 'auto_retry')",
                 [],
             )
             .map_err(|error| error.to_string())?;
         Ok(ids)
+    }
+
+    pub fn has_pending_work(&self) -> Result<bool, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM download_jobs
+                 WHERE status IN ('queued', 'resolving', 'downloading', 'verifying')
+                    OR (status = 'failed' AND error_code = 'auto_retry'))",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| error.to_string())
     }
 
     pub fn next_queued_jobs(&self, limit: usize) -> Result<Vec<String>, String> {
@@ -210,7 +227,8 @@ impl DownloadRepository {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         let mut stmt = connection
             .prepare(
-                "SELECT id FROM download_jobs WHERE status IN ('queued', 'resolving', 'downloading', 'verifying')",
+                "SELECT id FROM download_jobs WHERE status IN ('queued', 'resolving', 'downloading', 'verifying')
+                    OR (status = 'failed' AND error_code = 'auto_retry')",
             )
             .map_err(|e| e.to_string())?;
         let ids: Vec<String> = stmt
@@ -222,8 +240,12 @@ impl DownloadRepository {
 
         connection
             .execute(
-                "UPDATE download_jobs SET status = 'paused', speed_bps = 0, updated_at = CURRENT_TIMESTAMP
-                 WHERE status IN ('queued', 'resolving', 'downloading', 'verifying')",
+                "UPDATE download_jobs SET status = 'paused', speed_bps = 0,
+                    error_code = CASE WHEN error_code = 'auto_retry' THEN NULL ELSE error_code END,
+                    error_message = CASE WHEN error_code = 'auto_retry' THEN NULL ELSE error_message END,
+                    updated_at = CURRENT_TIMESTAMP
+                 WHERE status IN ('queued', 'resolving', 'downloading', 'verifying')
+                    OR (status = 'failed' AND error_code = 'auto_retry')",
                 [],
             )
             .map_err(|error| error.to_string())?;
@@ -270,7 +292,8 @@ impl DownloadRepository {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
         let mut stmt = connection
             .prepare(
-                "SELECT id FROM download_jobs WHERE status IN ('queued', 'resolving', 'downloading', 'verifying', 'paused')",
+                "SELECT id FROM download_jobs WHERE status IN ('queued', 'resolving', 'downloading', 'verifying', 'paused')
+                    OR (status = 'failed' AND error_code = 'auto_retry')",
             )
             .map_err(|e| e.to_string())?;
         let ids: Vec<String> = stmt
@@ -283,7 +306,8 @@ impl DownloadRepository {
         connection
             .execute(
                 "UPDATE download_jobs SET status = 'cancelled', speed_bps = 0, updated_at = CURRENT_TIMESTAMP
-                 WHERE status IN ('queued', 'resolving', 'downloading', 'verifying', 'paused')",
+                 WHERE status IN ('queued', 'resolving', 'downloading', 'verifying', 'paused')
+                    OR (status = 'failed' AND error_code = 'auto_retry')",
                 [],
             )
             .map_err(|error| error.to_string())?;
@@ -410,6 +434,24 @@ impl DownloadRepository {
             )
             .map_err(|error| error.to_string())?;
         Self::get_by_id(&connection, id)?.ok_or_else(|| "Download job not found".to_string())
+    }
+
+    /// Conditional, so a pause, cancel or manual retry during the wait wins.
+    pub fn requeue_auto_retry(&self, id: &str) -> Result<Option<DownloadJob>, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let updated = connection
+            .execute(
+                "UPDATE download_jobs SET status = 'queued', retry_count = retry_count + 1,
+                    speed_bps = 0, error_code = NULL, error_message = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1 AND status = 'failed' AND error_code = ?2",
+                params![id, AUTO_RETRY_CODE],
+            )
+            .map_err(|error| error.to_string())?;
+        if updated == 0 {
+            return Ok(None);
+        }
+        Self::get_by_id(&connection, id)
     }
 
     pub fn remove(&self, id: &str) -> Result<bool, String> {
@@ -784,6 +826,43 @@ mod tests {
         repository.update_status("job-1", "downloading").unwrap();
         assert_eq!(repository.recover_interrupted().unwrap(), vec!["job-1"]);
         assert_eq!(repository.get("job-1").unwrap().unwrap().status, "queued");
+    }
+
+    #[test]
+    fn pending_auto_retry_requeues_unless_user_acted_first() {
+        let repository = DownloadRepository::in_memory();
+        repository.create_or_get(input()).unwrap();
+        repository
+            .mark_failed("job-1", AUTO_RETRY_CODE, "HTTP 503")
+            .unwrap();
+        let requeued = repository.requeue_auto_retry("job-1").unwrap().unwrap();
+        assert_eq!(requeued.status, "queued");
+        assert_eq!(requeued.retry_count, 1);
+        assert_eq!(requeued.error_code, None);
+
+        repository
+            .mark_failed("job-1", AUTO_RETRY_CODE, "HTTP 503")
+            .unwrap();
+        repository.cancel_all_active_and_queued().unwrap();
+        assert!(repository.requeue_auto_retry("job-1").unwrap().is_none());
+        assert_eq!(
+            repository.get("job-1").unwrap().unwrap().status,
+            "cancelled"
+        );
+    }
+
+    #[test]
+    fn pause_all_holds_pending_auto_retries() {
+        let repository = DownloadRepository::in_memory();
+        repository.create_or_get(input()).unwrap();
+        repository
+            .mark_failed("job-1", AUTO_RETRY_CODE, "timed out")
+            .unwrap();
+        assert_eq!(repository.pause_all_active().unwrap().len(), 1);
+        let paused = repository.get("job-1").unwrap().unwrap();
+        assert_eq!(paused.status, "paused");
+        assert_eq!(paused.error_code, None);
+        assert!(repository.requeue_auto_retry("job-1").unwrap().is_none());
     }
 
     #[test]

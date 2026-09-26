@@ -1,6 +1,7 @@
 import type { Post, Attachment, Creator, CreatorProfile } from '$lib/types/content';
 import { providerState } from '$lib/state/providerState.svelte';
 import { thumbHashToUrl } from './thumbhash';
+import { extraField } from './fields';
 import { apiProbeDownloadSize } from '$lib/utils/ipc';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { serverPortState } from '$lib/state/serverPort.svelte';
@@ -183,6 +184,23 @@ export function creatorPlaceholderUrl(creator?: Creator | CreatorProfile | null)
   return thumb ? (thumbHashToUrl(thumb) || undefined) : undefined;
 }
 
+function hidePlaceholderBefore(img: HTMLElement) {
+  const prev = img.previousElementSibling;
+  if (prev instanceof HTMLElement && prev.classList.contains('placeholder-blur')) {
+    prev.style.display = 'none';
+  }
+}
+
+export function onAvatarLoad(event: Event) {
+  hidePlaceholderBefore(event.currentTarget as HTMLElement);
+}
+
+export function onAvatarError(event: Event) {
+  const img = event.currentTarget as HTMLElement;
+  img.style.display = 'none';
+  hidePlaceholderBefore(img);
+}
+
 export function creatorBannerUrl(service?: string, creatorId?: string, _thumbhash?: string | null, explicitProviderId?: string): string {
   if (!service || !creatorId) return '';
   const base = getProviderBaseUrl(service, explicitProviderId, true);
@@ -292,19 +310,11 @@ export function isSameAttachment(a: Attachment | null | undefined, b: Attachment
 
 export function attachmentThumbnailUrl(file: Attachment, _service?: string, post?: Post | null): string {
   if (!file) return '';
-  if (file.thumbnail_url) return file.thumbnail_url;
-  const extra = file.extra as Record<string, unknown> | undefined;
-  if (extra?.thumbnail_url) return extra.thumbnail_url as string;
-  if (extra?.preview_path) {
-    const p = extra.preview_path as string;
-    if (!p.includes('/previews/') && !p.includes('\\previews\\')) {
-      const local = resolveLocalMediaUrl(p);
-      if (local) return local;
-    }
-  }
-  if (extra?.local_preview_path) {
-    const p = extra.local_preview_path as string;
-    if (!p.includes('/previews/') && !p.includes('\\previews\\')) {
+  const thumbnail = extraField<string>(file, 'thumbnail_url');
+  if (thumbnail) return thumbnail;
+  for (const key of ['preview_path', 'local_preview_path']) {
+    const p = extraField<string>(file, key);
+    if (p && !p.includes('/previews/') && !p.includes('\\previews\\')) {
       const local = resolveLocalMediaUrl(p);
       if (local) return local;
     }
@@ -321,9 +331,8 @@ export function attachmentThumbnailUrl(file: Attachment, _service?: string, post
     if (post.attachments) {
       const match = post.attachments.find((att) => isSameAttachment(att, file));
       if (match) {
-        if (match.thumbnail_url) return match.thumbnail_url;
-        const matchExtra = match.extra as Record<string, unknown> | undefined;
-        if (matchExtra?.thumbnail_url) return matchExtra.thumbnail_url as string;
+        const matchThumbnail = extraField<string>(match, 'thumbnail_url');
+        if (matchThumbnail) return matchThumbnail;
       }
     }
     if (!post.file && post.attachments && post.attachments.length === 1 && isSameAttachment(post.attachments[0], file)) {
@@ -343,11 +352,7 @@ export function postThumbnailUrl(post: Post): string | null {
 
 export function postThumbnailSrc(post?: Post | null): string | null {
   if (!post) return null;
-  const extra = post.extra as Record<string, unknown> | undefined;
-  const previewPath =
-    post.preview_path ||
-    (extra?.local_preview_path as string | undefined) ||
-    (extra?.preview_path as string | undefined);
+  const previewPath = post.preview_path || extraField<string>(post, 'local_preview_path');
   if (previewPath && !previewPath.includes('/previews/') && !previewPath.includes('\\previews\\')) {
     const local = resolveLocalMediaUrl(previewPath);
     if (local) return local;
@@ -741,15 +746,12 @@ export function getPostFileCounts(post: Post): PostFileCounts {
   const items: Attachment[] = [];
   const seenKeys = new Set<string>();
 
+  const identity = (att: Attachment) =>
+    String(att.path || att.name || extraField(att, 'storage_key') || extraField(att, 'id') || '').toLowerCase();
+
   const registerItem = (att?: Attachment | null) => {
     if (!att) return;
-    const key = (
-      att.path ||
-      att.name ||
-      (att.extra as any)?.storage_key ||
-      (att as any)?.id ||
-      ''
-    ).toLowerCase();
+    const key = identity(att);
     if (key) {
       if (seenKeys.has(key)) return;
       seenKeys.add(key);
@@ -757,7 +759,10 @@ export function getPostFileCounts(post: Post): PostFileCounts {
     items.push(att);
   };
 
-  registerItem(post.file);
+  // A primary file with no identity (a locked placeholder) duplicates an attachment.
+  if (post.file && (identity(post.file) || !hasLoadedAttachments)) {
+    registerItem(post.file);
+  }
   if (Array.isArray(post.attachments)) {
     for (const a of post.attachments) {
       registerItem(a);

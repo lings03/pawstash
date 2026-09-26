@@ -1,7 +1,14 @@
 import type { Post, Creator } from '$lib/types/content';
 import type { FilterMap, TriStateFilter } from '$lib/types/filter';
 import { matchesTriStateFilter } from '$lib/types/filter';
-import { apiFetchPopularPosts, apiFetchRecentPosts, apiSearchHash, apiFetchPost } from '$lib/utils/ipc';
+import {
+  apiFetchPopularPosts,
+  apiFetchRecentPosts,
+  apiSearchHash,
+  apiFetchPost,
+  type PartialPostsEvent
+} from '$lib/utils/ipc';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getPostFormats } from '$lib/utils/media';
 import { parseTags } from '$lib/utils/formatters';
 import { logger } from '$lib/utils/logger';
@@ -12,6 +19,28 @@ import { providerState } from './providerState.svelte';
 const PAGE_SIZE = 50;
 export type FeedMode = 'recent' | 'popular';
 export type PopularPeriod = string;
+
+const postKey = (post: Post) => `${post.service}:${post.user}:${post.id}`;
+
+function sortForMode(posts: Post[], mode: FeedMode): Post[] {
+  const sorted = [...posts];
+  if (mode === 'popular') {
+    sorted.sort((a, b) => (b.favorite_count ?? 0) - (a.favorite_count ?? 0));
+  } else {
+    const ts = (post: Post) => Number(post.published ?? post.added ?? 0) || 0;
+    sorted.sort((a, b) => ts(b) - ts(a));
+  }
+  return sorted;
+}
+
+interface ActiveStream {
+  id: string;
+  bucket: FeedBucket;
+  mode: FeedMode;
+  requestId: number;
+  replaceOnFirstBatch: boolean;
+  seeded: boolean;
+}
 
 interface FeedBucket {
   posts: Post[];
@@ -46,6 +75,9 @@ export class FeedState {
   popularDate = $state<string>('');
   recent = $state<FeedBucket>(emptyBucket());
   popularBuckets = $state<Record<string, FeedBucket>>({});
+
+  private activeStream: ActiveStream | null = null;
+  private partialListener: Promise<UnlistenFn> | null = null;
 
   get searchQuery(): string {
     return this._searchQuery;
@@ -238,7 +270,17 @@ export class FeedState {
         effectiveQuery = `${query} only=ai`;
       }
 
-      const posts = await apiFetchRecentPosts(effectiveQuery, offset);
+      const streamId = `search:${requestId}:${Date.now()}`;
+      await this.beginStream({
+        id: streamId,
+        bucket,
+        mode: 'recent',
+        requestId,
+        replaceOnFirstBatch: reset,
+        seeded: false
+      });
+
+      const posts = await apiFetchRecentPosts(effectiveQuery, offset, streamId);
       if (requestId !== bucket.requestId || query !== this._searchQuery.trim()) return;
       const nextPosts = reset ? posts : [...bucket.posts, ...posts];
       bucket.posts = [...new Map(nextPosts.map((post) => [`${post.service}:${post.user}:${post.id}`, post])).values()];
@@ -250,6 +292,10 @@ export class FeedState {
         bucket.error = error instanceof Error ? error.message : String(error);
       }
     } finally {
+      // Request ids are per bucket, so compare the bucket too.
+      if (this.activeStream?.bucket === bucket && this.activeStream.requestId === requestId) {
+        this.activeStream = null;
+      }
       if (requestId === bucket.requestId) bucket.loading = false;
     }
   }
@@ -290,9 +336,19 @@ export class FeedState {
         queryParam = 'only=ai';
       }
 
+      const streamId = `${mode}:${requestId}:${Date.now()}`;
+      await this.beginStream({
+        id: streamId,
+        bucket,
+        mode,
+        requestId,
+        replaceOnFirstBatch: reset,
+        seeded: false
+      });
+
       const posts = mode === 'recent'
-        ? await apiFetchRecentPosts(queryParam, offset)
-        : await apiFetchPopularPosts(period, date || undefined, offset);
+        ? await apiFetchRecentPosts(queryParam, offset, streamId)
+        : await apiFetchPopularPosts(period, date || undefined, offset, streamId);
       if (requestId !== bucket.requestId) return;
       const nextPosts = reset ? posts : [...bucket.posts, ...posts];
       bucket.posts = [...new Map(nextPosts.map((post) => [`${post.service}:${post.user}:${post.id}`, post])).values()];
@@ -306,8 +362,43 @@ export class FeedState {
         logger.error(`[Feed] Failed to load feed (mode: ${mode}, offset: ${offset})`, error);
       }
     } finally {
+      // Request ids are per bucket, so compare the bucket too.
+      if (this.activeStream?.bucket === bucket && this.activeStream.requestId === requestId) {
+        this.activeStream = null;
+      }
       if (requestId === bucket.requestId) bucket.loading = false;
     }
+  }
+
+  private async beginStream(stream: ActiveStream) {
+    this.activeStream = stream;
+    // Listen before requesting: the cached batch is emitted immediately.
+    this.partialListener ??= listen<PartialPostsEvent>('posts-partial', (event) => {
+      const active = this.activeStream;
+      if (!active || event.payload.stream_id !== active.id) return;
+      if (active.requestId !== active.bucket.requestId) return;
+      this.applyPartial(active, event.payload.posts);
+    }).catch((error) => {
+      this.partialListener = null;
+      logger.warn('[Feed] Streaming unavailable; waiting for full results', error);
+      return () => {};
+    });
+    await this.partialListener;
+  }
+
+  private applyPartial(stream: ActiveStream, batch: Post[]) {
+    const bucket = stream.bucket;
+    if (stream.replaceOnFirstBatch && !stream.seeded) {
+      bucket.posts = [];
+      stream.seeded = true;
+    }
+    const merged = new Map(bucket.posts.map((post) => [postKey(post), post]));
+    for (const post of batch) {
+      const key = postKey(post);
+      if (!merged.has(key)) merged.set(key, post);
+    }
+    bucket.posts = sortForMode([...merged.values()], stream.mode);
+    bucket.loaded = true;
   }
 
   clearAll() {

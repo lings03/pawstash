@@ -1,10 +1,11 @@
 use super::client::{
     CreateAccountRequest, PushRecordInput, ReplaceBundleRequest, SyncDevice, SyncHttpClient,
+    PULL_PAGE_LIMIT,
 };
 use super::crypto::{
-    decrypt_record, encrypt_record, unwrap_vault, wrap_vault, KdfEnvelope, VaultSecrets,
+    decrypt_record, encrypt_record, unwrap_vault, wrap_vault, KdfEnvelope, VaultSecrets, KEY_BYTES,
 };
-use super::repository::{SyncRepository, SyncState};
+use super::repository::{RemoteApply, SyncRepository, SyncState};
 use super::secrets::SecretStore;
 use crate::config::settings::ConfigManager;
 use serde::{Deserialize, Serialize};
@@ -71,6 +72,10 @@ pub struct SyncManager {
     on_change_notify: Arc<tokio::sync::Notify>,
 }
 impl SyncManager {
+    pub fn is_syncing(&self) -> bool {
+        self.syncing.lock().map(|syncing| *syncing).unwrap_or(true)
+    }
+
     pub fn new(repository: Arc<SyncRepository>, config: Arc<ConfigManager>) -> Self {
         Self {
             repository,
@@ -554,6 +559,100 @@ impl SyncManager {
         let _ = app.emit("sync-status-updated", &status);
         result.map(|_| status)
     }
+    /// A full page that doesn't advance the cursor ends the pull; asking again would
+    /// return the same page forever.
+    async fn pull_all(
+        &self,
+        app: &tauri::AppHandle,
+        client: &SyncHttpClient,
+        token: &str,
+        key: &[u8; KEY_BYTES],
+        cursor: &mut i64,
+    ) -> Result<(), String> {
+        loop {
+            if self.repository.state()?.is_none() {
+                return Err("Sync was disconnected".to_string());
+            }
+            emit_sync_progress(
+                app,
+                "pulling",
+                None,
+                None,
+                None,
+                Some("Fetching changes..."),
+            );
+            tracing::debug!(cursor = *cursor, "Sync: pulling changes...");
+            let pull = client.pull(token, *cursor).await?;
+            let change_count = pull.changes.len();
+            tracing::info!(
+                count = change_count,
+                cursor = pull.cursor,
+                "Sync: received changes from server"
+            );
+
+            let mut batch = Vec::with_capacity(change_count);
+            for (idx, change) in pull.changes.iter().enumerate() {
+                if idx % 50 == 0 || idx + 1 == change_count {
+                    emit_sync_progress(
+                        app,
+                        "pulling",
+                        Some(idx + 1),
+                        Some(change_count),
+                        Some((idx + 1) as f32 / change_count as f32),
+                        Some("Applying changes..."),
+                    );
+                }
+                let plaintext = if change.tombstone {
+                    None
+                } else {
+                    Some(decrypt_record(
+                        key,
+                        &change.record_id,
+                        &change.ciphertext,
+                        &change.nonce,
+                    )?)
+                };
+                batch.push(RemoteApply {
+                    record_id: &change.record_id,
+                    kind: &change.kind,
+                    revision: change.revision,
+                    plaintext,
+                    tombstone: change.tombstone,
+                });
+            }
+            if !batch.is_empty() {
+                if let Err(e) = self.repository.apply_remote_changes(&batch) {
+                    tracing::error!(error = %e, count = batch.len(), "Sync: failed to apply remote changes");
+                    return Err(e);
+                }
+            }
+
+            let page_max = pull.changes.iter().map(|c| c.position).max().unwrap_or(0);
+            let mut next = pull.cursor.max(page_max);
+            // Servers with a pruned change log answer a snapshot with cursor 0. Positions are
+            // global, so 1 safely marks the snapshot as applied.
+            if next == 0 && *cursor == 0 && change_count > 0 {
+                next = 1;
+            }
+            let advanced = next > *cursor;
+            if advanced {
+                *cursor = next;
+                self.repository.update_cursor(next)?;
+            }
+            if change_count < PULL_PAGE_LIMIT {
+                return Ok(());
+            }
+            if !advanced {
+                tracing::warn!(
+                    count = change_count,
+                    cursor = pull.cursor,
+                    "Sync: server returned a full page without advancing the cursor; stopping pull"
+                );
+                return Ok(());
+            }
+        }
+    }
+
     async fn sync_inner(&self, app: &tauri::AppHandle) -> Result<(), String> {
         let state = self
             .repository
@@ -583,69 +682,8 @@ impl SyncManager {
         tracing::debug!("Sync: session authenticated successfully");
 
         let mut current_cursor = state.cursor;
-        loop {
-            emit_sync_progress(
-                app,
-                "pulling",
-                None,
-                None,
-                None,
-                Some("Fetching changes..."),
-            );
-            tracing::debug!(cursor = current_cursor, "Sync: pulling changes...");
-            let pull = client.pull(&session.token, current_cursor).await?;
-            let change_count = pull.changes.len();
-            tracing::info!(
-                count = change_count,
-                cursor = pull.cursor,
-                "Sync: received changes from server"
-            );
-            for (idx, change) in pull.changes.iter().enumerate() {
-                if change_count > 0 {
-                    let prog = (idx + 1) as f32 / change_count as f32;
-                    emit_sync_progress(
-                        app,
-                        "pulling",
-                        Some(idx + 1),
-                        Some(change_count),
-                        Some(prog),
-                        Some("Applying changes..."),
-                    );
-                }
-                let plain = if change.tombstone {
-                    None
-                } else {
-                    Some(decrypt_record(
-                        &key,
-                        &change.record_id,
-                        &change.ciphertext,
-                        &change.nonce,
-                    )?)
-                };
-                if let Err(e) = self.repository.apply_remote_change(
-                    &change.record_id,
-                    &change.kind,
-                    change.revision,
-                    plain.as_deref(),
-                    change.tombstone,
-                ) {
-                    tracing::error!(
-                        record_id = %change.record_id,
-                        kind = %change.kind,
-                        error = %e,
-                        "Sync: failed to apply remote change"
-                    );
-                    return Err(e);
-                }
-            }
-            if pull.cursor > current_cursor {
-                current_cursor = pull.cursor;
-                self.repository.update_cursor(current_cursor)?;
-            }
-            if change_count == 0 || change_count < 500 {
-                break;
-            }
-        }
+        self.pull_all(app, &client, &session.token, &key, &mut current_cursor)
+            .await?;
 
         for _ in 0..5 {
             let dirty_records = self.repository.detect_and_get_dirty_records()?;
@@ -703,11 +741,10 @@ impl SyncManager {
 
                 match push_result {
                     Ok(push_response) => {
+                        // The cursor isn't advanced from the push: changes other
+                        // devices pushed since our pull sit below our position.
                         self.repository
                             .mark_records_synced(&push_response.accepted)?;
-                        if push_response.cursor > 0 {
-                            self.repository.update_cursor(push_response.cursor)?;
-                        }
                         pushed_count += chunk.len();
                         tracing::debug!(
                             pushed = pushed_count,
@@ -735,30 +772,8 @@ impl SyncManager {
                             None,
                             Some("Resolving conflict..."),
                         );
-                        let pull = client.pull(&session.token, current_cursor).await?;
-                        for change in &pull.changes {
-                            let plain = if change.tombstone {
-                                None
-                            } else {
-                                Some(decrypt_record(
-                                    &key,
-                                    &change.record_id,
-                                    &change.ciphertext,
-                                    &change.nonce,
-                                )?)
-                            };
-                            self.repository.apply_remote_change(
-                                &change.record_id,
-                                &change.kind,
-                                change.revision,
-                                plain.as_deref(),
-                                change.tombstone,
-                            )?;
-                        }
-                        if pull.cursor > current_cursor {
-                            current_cursor = pull.cursor;
-                            self.repository.update_cursor(current_cursor)?;
-                        }
+                        self.pull_all(app, &client, &session.token, &key, &mut current_cursor)
+                            .await?;
                         had_conflict = true;
                         break;
                     }

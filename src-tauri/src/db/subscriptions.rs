@@ -247,10 +247,14 @@ impl SubscriptionRepository {
 
     pub fn delete(&self, id: &str) -> Result<bool, String> {
         let connection = self.connection.lock().map_err(|e| e.to_string())?;
-        connection
+        let count = connection
             .execute("DELETE FROM subscriptions WHERE id = ?1", params![id])
-            .map(|n| n > 0)
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        let _ = connection.execute(
+            "DELETE FROM content_pins WHERE reason = 'subscription' AND (service, creator_id) NOT IN (SELECT service, creator_id FROM subscriptions)",
+            [],
+        );
+        Ok(count > 0)
     }
 }
 

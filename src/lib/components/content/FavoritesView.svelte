@@ -9,7 +9,7 @@
   import { i18n } from '$lib/i18n';
   import { apiSaveSettings } from '$lib/utils/ipc';
   import { formatDate } from '$lib/utils/formatters';
-  import { creatorAvatarSrc, creatorPlaceholderUrl } from '$lib/utils/media';
+  import { creatorAvatarSrc, creatorPlaceholderUrl, onAvatarError, onAvatarLoad } from '$lib/utils/media';
   import { SCROLLABLE_CONTEXT, type ScrollableContext } from '$lib/actions/scrollable';
   import type { Creator, Favorite, Post } from '$lib/types/content';
   import PageShell from '$lib/components/layout/PageShell.svelte';
@@ -67,6 +67,7 @@
   import type { FilterMap } from '$lib/types/filter';
   import { countActiveFilters, matchesTriStateFilter, toggleFilterKey } from '$lib/types/filter';
   import { getPostFormats } from '$lib/utils/media';
+  import { extraField } from '$lib/utils/fields';
   import { parseTags } from '$lib/utils/formatters';
 
   type FavoritesTab = 'posts' | 'creators';
@@ -215,7 +216,7 @@
         p.thumbnail_url ||
         p.media_url ||
         p.preview_path ||
-        (p.extra as any)?.local_preview_path
+        extraField(p, 'local_preview_path')
       );
       return !hasMedia;
     });
@@ -226,7 +227,7 @@
     for (const post of batch) {
       const key = `${post.service}:${post.user}:${post.id}`;
       enrichingPostKeys.add(key);
-      void contentState.loadPost(post.service, post.user, post.id);
+      contentState.enqueueDetailPrefetch(post.service, post.user, post.id);
     }
   });
 
@@ -1082,7 +1083,15 @@
             <img class="grid-tile-media placeholder-blur" src={placeholder} alt="" aria-hidden="true" />
           {/if}
           {#if avatarSrc}
-            <img class="grid-tile-media" src={avatarSrc} alt="" loading="lazy" decoding="async" onerror={(event) => ((event.currentTarget as HTMLImageElement).style.display = 'none')} />
+            <img
+              class="grid-tile-media"
+              src={avatarSrc}
+              alt=""
+              loading="lazy"
+              decoding="async"
+              onload={onAvatarLoad}
+              onerror={onAvatarError}
+            />
           {/if}
           <div class="grid-tile-shade"></div>
           <div class="grid-tile-footer">

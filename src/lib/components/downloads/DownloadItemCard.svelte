@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { DownloadItem } from '$lib/types/download';
+  import { isAutoRetryPending, type DownloadItem } from '$lib/types/download';
   import { downloadState } from '$lib/state/downloadState.svelte';
   import { configState } from '$lib/state/configState.svelte';
   import { i18n } from '$lib/i18n';
@@ -25,6 +25,7 @@
   import IconLoading from '~icons/svg-spinners/3-dots-fade';
   import PopoverMenu from '$lib/components/ui/PopoverMenu.svelte';
   import { getMediaThumbnail } from '$lib/utils/mediaThumbnail';
+  import { thumbnailKey } from '$lib/utils/cacheKey';
   import { playbackState } from '$lib/state/playbackState.svelte';
 
   interface Props {
@@ -48,6 +49,7 @@
   let ratio = $derived(ratios[configState.settings.grid_aspect_ratio]);
   let percent = $derived(item.total_bytes > 0 ? Math.min(100, Math.round(item.downloaded_bytes / item.total_bytes * 100)) : 0);
   let active = $derived(['queued', 'resolving', 'downloading', 'verifying'].includes(item.status));
+  let retryPending = $derived(isAutoRetryPending(item));
   let extension = $derived(item.filename.includes('.') ? (item.filename.split('.').pop() || '').toLowerCase() : '');
   let mediaKind = $derived(/^(avif|bmp|gif|jpe?g|png|webp)$/.test(extension) ? 'image' : /^(m4v|mkv|mov|mp4|webm)$/.test(extension) ? 'video' : /^(aac|flac|m4a|mp3|ogg|opus|wav)$/.test(extension) ? 'audio' : 'file');
 
@@ -109,7 +111,11 @@
   function requestMediaThumbnail() {
     if (generatedThumbnail || !previewUrl) return;
     if (mediaKind !== 'video' && mediaKind !== 'image') return;
-    const key = item.media_id || item.id || item.filename;
+    const key = thumbnailKey(item.media_id || item.id || item.filename, {
+      service: item.service ?? '',
+      creator_id: item.creator_id ?? '',
+      id: item.post_id ?? ''
+    });
     getMediaThumbnail(key, previewUrl, mediaKind).then((thumb) => {
       if (thumb) {
         generatedThumbnail = thumb;
@@ -350,9 +356,13 @@
       <p class="download-post-title" title={postTitle}>{postTitle}</p>
     {/if}
     {#if item.status !== 'completed'}
-      <div class="grid-tile-author download-status-row" data-status={item.status}>
-        {#if busy}<IconLoading />{:else if item.status === 'failed' || item.status === 'missing'}<IconError />{:else}<IconDownload />{/if}
-        <span class="grid-tile-author-name">{i18n.t(`downloads.status_${item.status}`)}</span>
+      <div
+        class="grid-tile-author download-status-row"
+        data-status={retryPending ? 'retrying' : item.status}
+        title={item.status === 'failed' ? item.error_message : undefined}
+      >
+        {#if busy || retryPending}<IconLoading />{:else if item.status === 'failed' || item.status === 'missing'}<IconError />{:else}<IconDownload />{/if}
+        <span class="grid-tile-author-name">{i18n.t(retryPending ? 'downloads.status_retrying' : `downloads.status_${item.status}`)}</span>
       </div>
     {/if}
     <div class="grid-tile-meta">
@@ -394,11 +404,6 @@
   .download-status-row { pointer-events: none !important; }
   .download-status-row > :global(svg) { width: calc(15px * var(--grid-scale, 1)); height: calc(15px * var(--grid-scale, 1)); flex: none; color: var(--on-media-secondary); }
   .download-status-row .grid-tile-author-name { cursor: default; pointer-events: none; }
-  .download-progress { position: absolute; z-index: 7; inset: auto 0 0; height: calc(3px * var(--grid-scale, 1)); overflow: hidden; background: rgba(var(--surface-tint-rgb), .16); pointer-events: none; }
-  .download-progress > span { display: block; height: 100%; background: var(--accent-primary); transition: width 220ms var(--ease-expo); }
-  .download-progress.indeterminate::after { position: absolute; inset: 0; width: 35%; content: ''; background: var(--accent-primary); animation: indeterminate 1.2s ease-in-out infinite; }
-  @keyframes indeterminate { from { transform: translateX(-110%); } to { transform: translateX(330%); } }
-  @media (prefers-reduced-motion: reduce) { .download-progress.indeterminate::after { animation: none; width: 100%; opacity: .45; } }
 
   .download-play-menu {
     display: flex;
