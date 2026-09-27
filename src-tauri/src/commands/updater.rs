@@ -214,7 +214,18 @@ fn get_update_temp_dir() -> Result<std::path::PathBuf, String> {
         Ok(std::env::temp_dir())
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(all(target_os = "linux", not(target_os = "android")))]
+    {
+        if let Some(cache_dir) = dirs::cache_dir() {
+            let update_dir = cache_dir.join("pawstash").join("updates");
+            if std::fs::create_dir_all(&update_dir).is_ok() {
+                return Ok(update_dir);
+            }
+        }
+        Ok(std::env::temp_dir())
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
     {
         Ok(std::env::temp_dir())
     }
@@ -440,6 +451,16 @@ fn launch_installer_and_exit(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(target_path, std::fs::Permissions::from_mode(0o755));
 
+        let is_sandboxed = std::path::Path::new("/.flatpak-info").exists()
+            || std::env::var_os("SNAP").is_some();
+        if is_sandboxed {
+            std::process::Command::new("xdg-open")
+                .arg(target_path)
+                .spawn()
+                .map_err(|e| format!("Failed to open downloaded update: {e}"))?;
+            return Ok(());
+        }
+
         let ext = target_path
             .extension()
             .and_then(|e| e.to_str())
@@ -447,11 +468,69 @@ fn launch_installer_and_exit(
             .to_lowercase();
 
         if ext == "appimage" {
-            std::process::Command::new(target_path)
-                .spawn()
+            if let Ok(appimage_env) = std::env::var("APPIMAGE") {
+                let current_appimage = std::path::PathBuf::from(&appimage_env);
+                if current_appimage.exists() && current_appimage != *target_path {
+                    let tmp_dest = current_appimage.with_extension("appimage.update_tmp");
+                    let _ = std::fs::remove_file(&tmp_dest);
+                    if std::fs::copy(target_path, &tmp_dest).is_ok() {
+                        let _ = std::fs::set_permissions(
+                            &tmp_dest,
+                            std::fs::Permissions::from_mode(0o755),
+                        );
+                        if std::fs::rename(&tmp_dest, &current_appimage).is_ok() {
+                            let _ = std::fs::remove_file(target_path);
+                            let mut cmd = std::process::Command::new(&current_appimage);
+                            cmd.env_remove("APPDIR")
+                                .env_remove("ARGV0")
+                                .env_remove("OWD");
+                            cmd.spawn()
+                                .map_err(|e| format!("Failed to launch AppImage: {e}"))?;
+                            app_handle.exit(0);
+                            return Ok(());
+                        }
+                        let _ = std::fs::remove_file(&tmp_dest);
+                    }
+                }
+            }
+
+            let mut cmd = std::process::Command::new(target_path);
+            cmd.env_remove("APPDIR")
+                .env_remove("ARGV0")
+                .env_remove("OWD");
+            cmd.spawn()
                 .map_err(|e| format!("Failed to launch AppImage: {e}"))?;
             app_handle.exit(0);
             return Ok(());
+        } else if ext == "deb" {
+            let deb_str = target_path.to_string_lossy().to_string();
+            let current_exe = std::env::current_exe().ok();
+            let exe_str = current_exe
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "/usr/bin/pawstash".to_string());
+
+            let has_apt = std::path::Path::new("/usr/bin/apt-get").exists();
+            let has_pkexec = std::path::Path::new("/usr/bin/pkexec").exists();
+
+            if has_apt && has_pkexec {
+                let script = format!(
+                    "if pkexec apt-get install -y --reinstall \"{}\"; then \"{}\"; else \"{}\"; fi",
+                    deb_str, exe_str, exe_str
+                );
+                std::process::Command::new("sh")
+                    .args(["-c", &script])
+                    .spawn()
+                    .map_err(|e| format!("Failed to launch package installer: {e}"))?;
+                app_handle.exit(0);
+                return Ok(());
+            } else {
+                std::process::Command::new("xdg-open")
+                    .arg(target_path)
+                    .spawn()
+                    .map_err(|e| format!("Failed to open Linux package: {e}"))?;
+                return Ok(());
+            }
         } else {
             std::process::Command::new("xdg-open")
                 .arg(target_path)
@@ -583,12 +662,33 @@ fn find_platform_asset_ref(assets: &[ReleaseAsset]) -> Option<&ReleaseAsset> {
 
     #[cfg(all(target_os = "linux", not(target_os = "android")))]
     {
+        let is_sandboxed = std::path::Path::new("/.flatpak-info").exists()
+            || std::env::var_os("SNAP").is_some();
+        let is_running_appimage =
+            std::env::var_os("APPIMAGE").is_some() || std::env::var_os("APPDIR").is_some();
+
+        let is_deb_system = !is_sandboxed
+            && !is_running_appimage
+            && std::path::Path::new("/etc/debian_version").exists()
+            && (std::path::Path::new("/usr/bin/dpkg").exists()
+                || std::path::Path::new("/usr/bin/apt-get").exists());
+
+        if is_deb_system {
+            if let Some(asset) = assets
+                .iter()
+                .find(|a| a.name.to_lowercase().ends_with(".deb"))
+            {
+                return Some(asset);
+            }
+        }
+
         if let Some(asset) = assets
             .iter()
             .find(|a| a.name.ends_with(".AppImage") || a.name.to_lowercase().ends_with(".appimage"))
         {
             return Some(asset);
         }
+
         if let Some(asset) = assets
             .iter()
             .find(|a| a.name.to_lowercase().ends_with(".deb"))
@@ -777,5 +877,39 @@ mod tests {
 
         #[cfg(all(target_os = "linux", not(target_os = "android")))]
         assert!(name.unwrap().ends_with(".AppImage"));
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", not(target_os = "android")))]
+    fn test_platform_asset_resolution_deb() {
+        let assets = vec![
+            ReleaseAsset {
+                name: "pawstash_26.8.1_amd64.AppImage".to_string(),
+                browser_download_url: "https://github.com/pawstash/pawstash/releases/download/v26.8.1/pawstash_26.8.1_amd64.AppImage".to_string(),
+                size: 22_000_000,
+                content_type: None,
+                digest: None,
+            },
+            ReleaseAsset {
+                name: "pawstash_26.8.1_amd64.deb".to_string(),
+                browser_download_url: "https://github.com/pawstash/pawstash/releases/download/v26.8.1/pawstash_26.8.1_amd64.deb".to_string(),
+                size: 12_000_000,
+                content_type: None,
+                digest: None,
+            },
+        ];
+
+        let (_, name, _) = find_platform_asset(&assets);
+        assert!(name.is_some());
+        if std::path::Path::new("/etc/debian_version").exists()
+            && (std::path::Path::new("/usr/bin/dpkg").exists()
+                || std::path::Path::new("/usr/bin/apt-get").exists())
+            && std::env::var_os("APPIMAGE").is_none()
+            && std::env::var_os("APPDIR").is_none()
+            && !std::path::Path::new("/.flatpak-info").exists()
+            && std::env::var_os("SNAP").is_none()
+        {
+            assert!(name.unwrap().ends_with(".deb"));
+        }
     }
 }
