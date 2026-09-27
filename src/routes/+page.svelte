@@ -57,6 +57,7 @@
     initFrontendLogging();
     themeState.init();
     i18n.init();
+    document.documentElement.classList.toggle('webkitgtk', layoutState.isLinux);
 
     const preventPinchZoom = (e: TouchEvent) => {
       if (e.touches.length > 1) {

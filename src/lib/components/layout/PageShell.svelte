@@ -39,15 +39,32 @@
 
   let isScrolledTop = $state(false);
   let isScrolledBottom = $state(false);
+  let scrollContent = $state<HTMLElement | null>(null);
+
+  let scrollHeight = 0;
+  let clientHeight = 0;
 
   function updateScrollState(vp: HTMLElement | null) {
     if (!vp) return;
     const top = vp.scrollTop;
-    const scrollHeight = vp.scrollHeight;
-    const clientHeight = vp.clientHeight;
     isScrolledTop = top > 60;
     isScrolledBottom = (scrollHeight - top - clientHeight) > 16;
   }
+
+  function measure(vp: HTMLElement) {
+    scrollHeight = vp.scrollHeight;
+    clientHeight = vp.clientHeight;
+    updateScrollState(vp);
+  }
+
+  $effect(() => {
+    const vp = scrollContext.viewport;
+    if (!vp || !scrollContent) return;
+    const observer = new ResizeObserver(() => measure(vp));
+    observer.observe(vp);
+    observer.observe(scrollContent);
+    return () => observer.disconnect();
+  });
 
   let maskClass = $derived.by(() => {
     if (configState.settings.scroll_edge_mask === false) return '';
@@ -82,11 +99,11 @@
         onReady: (vp) => {
           scrollContext.viewport = vp;
           viewport = vp;
-          updateScrollState(vp);
+          if (vp) measure(vp);
         }
       }}
     >
-      <div class="page-scroll-content w-full">
+      <div class="page-scroll-content w-full" bind:this={scrollContent}>
         {@render children?.()}
       </div>
     </div>
